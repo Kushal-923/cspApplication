@@ -1,5 +1,5 @@
 """
-build_matrix_1.3.py  —  Punjab Border Coverage Matrix Builder (3D, terrain-aware)
+build_matrix_1.3.py  —  Border Coverage Matrix Builder (3D, terrain-aware)
 ===================================================================================
 
 What changed vs v1.2 (2D Euclidean):
@@ -44,31 +44,75 @@ v1.3.1 patch (post-review fixes, both integrated):
     only catches void pixels *inside* the raster.
 
 Not yet resolved (flagged, not silently decided):
-  - RADAR_SPECS range values are still 15/10/5 km here. You mentioned the
-    next step is moving these to a 3-8 km band — left untouched since
-    that's a separate change with its own consequences for the matrix;
-    swap RADAR_SPECS when you're ready and everything else keeps working.
-  - FOV bounds (THETA_MIN/MAX_BY_TYPE) are placeholder values pending
-    your professor's input, per the doc. ENABLE_FOV_CHECK defaults to
-    False so the matrix is LOS+curvature-only until those are confirmed.
+  - FOV bounds (theta_min/theta_max) and azimuth half-widths are no longer
+    hardcoded in this file — they are loaded per-type from
+    radar_type_config.json (see STEP 3/STEP 5 below), a file produced by
+    optimize_placement.py from user input. ENABLE_FOV_CHECK /
+    ENABLE_AZIMUTH_CHECK below remain this file's own toggles for whether
+    those loaded bounds are actually enforced when building c_matrix.json.
+  - Added an AZIMUTH (horizontal) FOV check — in_fov() only ever tested
+    elevation, so every radar was implicitly 360-deg omnidirectional in
+    the horizontal plane. in_azimuth() adds a directional sector test
+    against each radar's boresight_deg (loaded from
+    radar_meta_optimized.json; originally derived by
+    optimize_placement.py's inland_point(), facing back toward the border
+    segment the radar was offset from). Independent toggle:
+    ENABLE_AZIMUTH_CHECK, same as ENABLE_FOV_CHECK.
 
 Input:   punjab_border.geojson
-         <DEM_FILE>       — GLO-30 (or similar) DEM raster, any CRS
-                             (reprojected to EPSG:32643 automatically)
+         <DEM_FILE>                — GLO-30 (or similar) DEM raster, any CRS
+                                      (reprojected automatically to the
+                                      auto-detected UTM zone)
+         radar_meta_optimized.json — radar placement (name/x/y/range_m/type/
+                                      boresight_deg/ground_z/h_ant/z), produced
+                                      by optimize_placement.py. This script no
+                                      longer computes placement itself; it is a
+                                      pure "given a radar list + border + DEM,
+                                      produce c_matrix.json" step.
+         radar_type_config.json    — per-type FOV/azimuth bounds (theta_min,
+                                      theta_max, az_halfwidth), keyed by type
+                                      name, also produced by
+                                      optimize_placement.py.
 Output:  c_matrix.json    (N_radars x K_boundary_points binary matrix)
-         radar_meta.json  (radar names, UTM coords incl. z, ranges)
+         radar_meta.json  (pass-through re-export of the loaded radar list,
+                            same schema as radar_meta_optimized.json — kept
+                            under this filename so scheduler_1_2 (1).py and
+                            generate_czml.py need no changes)
+
+Cross-file invariant introduced by consuming external placement (see also
+CLAUDE.md):
+  - Every radar's "type" string in radar_meta_optimized.json MUST exist as a
+    key in radar_type_config.json. Both files are written together by a
+    single optimize_placement.py run, so this should hold by construction —
+    but if radar_meta_optimized.json is hand-edited, or the two files come
+    from different optimize_placement.py runs, this script fails fast with a
+    RuntimeError naming the offending radar and type rather than silently
+    skipping FOV/azimuth checks for it.
+  - ENABLE_FOV_CHECK / ENABLE_AZIMUTH_CHECK below should be kept consistent
+    with the same-named toggles in optimize_placement.py. optimize_placement.py
+    uses its own copies of these toggles to decide what coverage semantics to
+    OPTIMIZE the placement for; this script uses them to decide what coverage
+    semantics to actually ENCODE into c_matrix.json. If the two scripts
+    disagree, the radar positions could be well-suited to a coverage
+    definition this script no longer computes the same way.
 """
 
 import math
 import json
+import sys
 import numpy as np
 import geopandas as gpd
 from shapely.ops import linemerge, unary_union
-from shapely.geometry import Point
 
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from scipy.ndimage import map_coordinates
+
+# Console output below uses box-drawing/checkmark characters -- force
+# UTF-8 on stdout so this doesn't crash under a plain Windows console
+# (cp1252), which can't encode them.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 # ══════════════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -78,6 +122,14 @@ BORDER_FILE   = "punjab_border.geojson"
 DEM_FILE      = "punjab_dem.tif"     # GLO-30 or similar; any CRS, any tiling
 OUTPUT_MATRIX = "c_matrix.json"
 OUTPUT_META   = "radar_meta.json"
+
+# Radar placement + per-type config, produced by optimize_placement.py.
+# This script no longer computes placement itself -- it loads a
+# fully-computed radar list. Filenames match optimize_placement.py's own
+# OUTPUT_PLACEMENT / OUTPUT_TYPE_CONFIG constants exactly -- hand-edit
+# both together if you rename either output there.
+INPUT_PLACEMENT   = "radar_meta_optimized.json"
+INPUT_TYPE_CONFIG = "radar_type_config.json"
 
 # UTM zone is now AUTO-DETECTED from BORDER_FILE's own location (see
 # utm_epsg_for_lonlat() + STEP 1 below) instead of hardcoded. 32643 (UTM
@@ -90,14 +142,6 @@ OUTPUT_META   = "radar_meta.json"
 TARGET_EPSG = None   # placeholder; set for real in STEP 1
 
 INTERVAL_M  = 250     # metres between consecutive boundary points
-INLAND_M    = 2000    # metres radar is placed inland from border
-
-# Antenna mast height per radar type (z_i = DEM(x_i,y_i) + h_ant).
-H_ANT_BY_TYPE = {
-    "Large":  6.0,
-    "Medium": 4.0,
-    "Small":  3.0,
-}
 
 # Target height above ground (z_j = DEM(x_j,y_j) + H_TARGET).
 # 0.0 = worst case, ground-hugging target. Bump to ~1.8m for "person
@@ -114,57 +158,33 @@ R_EFF = K_REFRACTION * R_E   # ≈ 8,494,667 m
 DEM_PIXEL_M = 30.0            # GLO-30 resolution -> one check per pixel
 LOS_EPS_M   = 0.5             # tolerance at the terrain comparison
 
-# ── FOV / elevation window (pending professor confirmation) ──
-ENABLE_FOV_CHECK = False      # flip on once bounds below are confirmed
-THETA_MIN_BY_TYPE = {"Large": -2.0, "Medium": -3.0, "Small": -5.0}   # degrees
-THETA_MAX_BY_TYPE = {"Large": 30.0, "Medium": 25.0, "Small": 20.0}   # degrees
+# ── FOV / elevation window ────────────────────────────────────
+# Bounds themselves are no longer hardcoded here -- loaded per-type from
+# radar_type_config.json in STEP 3, looked up per-radar in STEP 5.
+ENABLE_FOV_CHECK = True
 
-# 35 heterogeneous radars spread evenly along the border. Unchanged from
-# v1.2 — see "Not yet resolved" above re: the pending 3-8km range change.
-RADAR_SPECS = [
-    # ── Zone 1  (0–14%) ──────────────────────────────────────
-    {"name": "R01_Small",  "pos_pct": 0.01, "range_m":  5_000, "type": "Small"},
-    {"name": "R02_Medium", "pos_pct": 0.04, "range_m": 10_000, "type": "Medium"},
-    {"name": "R03_Large",  "pos_pct": 0.07, "range_m": 15_000, "type": "Large"},
-    {"name": "R04_Medium", "pos_pct": 0.10, "range_m": 10_000, "type": "Medium"},
-    {"name": "R05_Small",  "pos_pct": 0.13, "range_m":  5_000, "type": "Small"},
-    # ── Zone 2  (14–28%) ─────────────────────────────────────
-    {"name": "R06_Small",  "pos_pct": 0.15, "range_m":  5_000, "type": "Small"},
-    {"name": "R07_Medium", "pos_pct": 0.18, "range_m": 10_000, "type": "Medium"},
-    {"name": "R08_Large",  "pos_pct": 0.21, "range_m": 15_000, "type": "Large"},
-    {"name": "R09_Medium", "pos_pct": 0.24, "range_m": 10_000, "type": "Medium"},
-    {"name": "R10_Small",  "pos_pct": 0.27, "range_m":  5_000, "type": "Small"},
-    # ── Zone 3  (28–42%) ─────────────────────────────────────
-    {"name": "R11_Small",  "pos_pct": 0.29, "range_m":  5_000, "type": "Small"},
-    {"name": "R12_Medium", "pos_pct": 0.32, "range_m": 10_000, "type": "Medium"},
-    {"name": "R13_Large",  "pos_pct": 0.35, "range_m": 15_000, "type": "Large"},
-    {"name": "R14_Medium", "pos_pct": 0.38, "range_m": 10_000, "type": "Medium"},
-    {"name": "R15_Small",  "pos_pct": 0.41, "range_m":  5_000, "type": "Small"},
-    # ── Zone 4  (42–56%) ─────────────────────────────────────
-    {"name": "R16_Small",  "pos_pct": 0.43, "range_m":  5_000, "type": "Small"},
-    {"name": "R17_Medium", "pos_pct": 0.46, "range_m": 10_000, "type": "Medium"},
-    {"name": "R18_Large",  "pos_pct": 0.50, "range_m": 15_000, "type": "Large"},
-    {"name": "R19_Medium", "pos_pct": 0.54, "range_m": 10_000, "type": "Medium"},
-    {"name": "R20_Small",  "pos_pct": 0.57, "range_m":  5_000, "type": "Small"},
-    # ── Zone 5  (56–70%) ─────────────────────────────────────
-    {"name": "R21_Small",  "pos_pct": 0.59, "range_m":  5_000, "type": "Small"},
-    {"name": "R22_Medium", "pos_pct": 0.62, "range_m": 10_000, "type": "Medium"},
-    {"name": "R23_Large",  "pos_pct": 0.65, "range_m": 15_000, "type": "Large"},
-    {"name": "R24_Medium", "pos_pct": 0.68, "range_m": 10_000, "type": "Medium"},
-    {"name": "R25_Small",  "pos_pct": 0.71, "range_m":  5_000, "type": "Small"},
-    # ── Zone 6  (70–84%) ─────────────────────────────────────
-    {"name": "R26_Small",  "pos_pct": 0.73, "range_m":  5_000, "type": "Small"},
-    {"name": "R27_Medium", "pos_pct": 0.76, "range_m": 10_000, "type": "Medium"},
-    {"name": "R28_Large",  "pos_pct": 0.79, "range_m": 15_000, "type": "Large"},
-    {"name": "R29_Medium", "pos_pct": 0.82, "range_m": 10_000, "type": "Medium"},
-    {"name": "R30_Small",  "pos_pct": 0.85, "range_m":  5_000, "type": "Small"},
-    # ── Zone 7  (84–100%) ────────────────────────────────────
-    {"name": "R31_Small",  "pos_pct": 0.87, "range_m":  5_000, "type": "Small"},
-    {"name": "R32_Medium", "pos_pct": 0.90, "range_m": 10_000, "type": "Medium"},
-    {"name": "R33_Large",  "pos_pct": 0.93, "range_m": 15_000, "type": "Large"},
-    {"name": "R34_Medium", "pos_pct": 0.96, "range_m": 10_000, "type": "Medium"},
-    {"name": "R35_Small",  "pos_pct": 0.99, "range_m":  5_000, "type": "Small"},
-]
+# ── FOV / azimuth window (horizontal field of view) ───────────
+# in_fov() above only ever checked elevation (vertical angle). It had
+# NO azimuth/bearing term at all, so every radar was implicitly treated
+# as 360 deg omnidirectional in the horizontal plane — it could "see"
+# radially inward, sideways, behind itself, etc., as long as elevation
+# + range + LOS passed. This block adds a horizontal sector check on
+# top of that, independent of ENABLE_FOV_CHECK (elevation) so either
+# axis can be toggled on its own while values are being tuned.
+#
+# BORESIGHT_DEG per radar = the direction the radar "faces". Computed once
+# by optimize_placement.py's inland_point() at placement time and loaded
+# here, already present as radar["boresight_deg"], in STEP 3.
+#
+# Angle convention: standard math bearing, atan2(dy, dx) in degrees,
+# 0 deg = +x (East), 90 deg = +y (North), increasing counter-clockwise.
+# This matches the convention used in in_azimuth() below — do not mix
+# with compass bearing (0=N, clockwise) without converting both ends.
+#
+# Halfwidth bounds themselves are no longer hardcoded here -- loaded
+# per-type from radar_type_config.json in STEP 3, looked up per-radar in
+# STEP 5, same as the elevation FOV bounds above.
+ENABLE_AZIMUTH_CHECK = True
 
 
 # ══════════════════════════════════════════════════════════════
@@ -188,32 +208,49 @@ class DEMReader:
                 "Set the CRS on the source raster first."
             )
 
-        if src.crs.to_epsg() == target_epsg:
-            # Already in the right frame — use as-is.
-            self.array = src.read(1).astype(np.float64)
-            self.transform = src.transform
-            self.nodata = src.nodata
-            src.close()
-        else:
-            # Reproject the whole raster into EPSG:32643 once, up front,
-            # rather than reprojecting coordinates per-sample. Cheaper
-            # and keeps the bilinear math in one consistent grid.
-            dst_transform, width, height = calculate_default_transform(
-                src.crs, f"EPSG:{target_epsg}", src.width, src.height, *src.bounds
-            )
-            dst_array = np.empty((height, width), dtype=np.float64)
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=dst_array,
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=dst_transform,
-                dst_crs=f"EPSG:{target_epsg}",
-                resampling=Resampling.bilinear,
-            )
-            self.array = dst_array
-            self.transform = dst_transform
-            self.nodata = src.nodata
+        # Both branches below actually read pixel data (a full-band read,
+        # or a reprojection warp that reads tiles progressively) -- either
+        # can fail with a low-level GDAL/rasterio error if the file is
+        # corrupted or truncated (e.g. an interrupted download that got
+        # saved as if it completed). Both failure shapes share the common
+        # base class rasterio.errors.RasterioError, so one except clause
+        # catches both and turns a cryptic GDAL traceback into a clear,
+        # actionable message instead.
+        try:
+            if src.crs.to_epsg() == target_epsg:
+                # Already in the right frame — use as-is.
+                self.array = src.read(1).astype(np.float64)
+                self.transform = src.transform
+                self.nodata = src.nodata
+            else:
+                # Reproject the whole raster into EPSG:32643 once, up front,
+                # rather than reprojecting coordinates per-sample. Cheaper
+                # and keeps the bilinear math in one consistent grid.
+                dst_transform, width, height = calculate_default_transform(
+                    src.crs, f"EPSG:{target_epsg}", src.width, src.height, *src.bounds
+                )
+                dst_array = np.empty((height, width), dtype=np.float64)
+                reproject(
+                    source=rasterio.band(src, 1),
+                    destination=dst_array,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=dst_transform,
+                    dst_crs=f"EPSG:{target_epsg}",
+                    resampling=Resampling.bilinear,
+                )
+                self.array = dst_array
+                self.transform = dst_transform
+                self.nodata = src.nodata
+        except rasterio.errors.RasterioError as e:
+            raise RuntimeError(
+                f"{path} could not be fully read -- this usually means the file is "
+                f"corrupted or truncated (e.g. an interrupted download saved as if "
+                f"it completed). Underlying error: {e}. Re-download the DEM (see "
+                "get_dem.py) and confirm the download actually finishes before "
+                "retrying."
+            ) from e
+        finally:
             src.close()
 
         # Inverse affine transform: UTM (x,y) -> fractional (col,row)
@@ -356,6 +393,36 @@ def in_fov(rz, pz, d_horiz, theta_min, theta_max):
     return theta_min <= theta_deg <= theta_max
 
 
+def in_azimuth(dx, dy, boresight_deg, halfwidth_deg):
+    """
+    Horizontal FOV check — the piece the original in_fov() never had.
+
+    dx, dy        : horizontal vector from radar to point (px - rx, py - ry),
+                    same UTM axes used everywhere else in this file.
+    boresight_deg : direction the radar faces, atan2(dy,dx) convention
+                    (0 deg = +x/East, 90 deg = +y/North, CCW-positive).
+    halfwidth_deg : +/- sector half-width around boresight. E.g. 90 deg
+                    gives a 180 deg-wide forward hemisphere; 180 deg
+                    effectively disables the check (full circle).
+
+    Edge case: dx == dy == 0 (point coincides with radar in x,y) has no
+    defined bearing. Treat as "in azimuth" — same convention as in_fov()
+    treating the equivalent d_horiz==0 case as a degenerate pass-through
+    rather than a hard fail, since range/LOS already handle that geometry
+    correctly on their own.
+    """
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return True
+
+    bearing_deg = math.degrees(math.atan2(dy, dx))
+
+    # Wrap the difference into (-180, 180] before comparing, so a sector
+    # straddling the +/-180 seam (e.g. boresight = 175 deg) doesn't
+    # falsely fail for points just past the wraparound.
+    diff = (bearing_deg - boresight_deg + 180.0) % 360.0 - 180.0
+    return abs(diff) <= halfwidth_deg
+
+
 def utm_epsg_for_lonlat(lon, lat):
     """
     Return the EPSG code of the UTM zone that contains (lon, lat).
@@ -384,7 +451,7 @@ def utm_epsg_for_lonlat(lon, lat):
 # ══════════════════════════════════════════════════════════════
 
 print("\n" + "═" * 60)
-print("  BUILD_MATRIX v1.3  —  3D Terrain-Aware Coverage Model")
+print("  BUILD_MATRIX v1.3  —  3D Terrain-Aware Coverage Model (external placement)")
 print("═" * 60)
 
 print(f"\n[1] Loading {BORDER_FILE} ...")
@@ -425,126 +492,113 @@ print(f"    K = {len(bpts)} boundary points")
 
 
 # ══════════════════════════════════════════════════════════════
-#  STEP 3 — DEPLOY RADARS  (unchanged tangent-offset method from v1.2)
+#  STEP 3 — LOAD RADAR PLACEMENT + TYPE CONFIG
+#  Placement (x, y, range_m, type, boresight_deg, ground_z, h_ant, z) is no
+#  longer computed here -- it was already fully computed once by
+#  optimize_placement.py and is loaded verbatim. This is now an inter-file
+#  contract between two independently-runnable scripts (not an in-memory
+#  guarantee within one script), so the loaded list is validated fail-fast
+#  before use, matching DEMReader.elevations()'s diagnostic style.
 # ══════════════════════════════════════════════════════════════
 
-def inland_point(line, fraction, offset_m, sign=1.0):
-    d      = fraction * line.length
-    pt     = line.interpolate(d)
-
-    eps    = min(1.0, line.length * 0.001)
-    pt_fwd = line.interpolate(min(d + eps, line.length))
-    pt_bwd = line.interpolate(max(d - eps, 0.0))
-
-    tx = pt_fwd.x - pt_bwd.x
-    ty = pt_fwd.y - pt_bwd.y
-    t_len = math.hypot(tx, ty)
-    if t_len == 0:
-        return pt
-
-    tx /= t_len
-    ty /= t_len
-    nx, ny = ty, -tx
-
-    return Point(pt.x + sign * nx * offset_m, pt.y + sign * ny * offset_m)
+REQUIRED_RADAR_FIELDS = (
+    "name", "x", "y", "range_m", "type",
+    "boresight_deg", "ground_z", "h_ant", "z",
+)
 
 
-# ══════════════════════════════════════════════════════════════
-#  STEP 2.5 — DETERMINE WHICH SIDE OF THE BORDER IS INDIA
-# ══════════════════════════════════════════════════════════════
-# inland_point()'s normal (ty, -tx) is a 90-deg rotation of the local
-# tangent. Which side that lands on depends on the local tangent
-# direction, which can vary along a curved border — the normal at one
-# position may point toward India while the normal at another position
-# (where the border bends) may point toward Pakistan.
-#
-# A single global INLAND_SIGN cannot handle this: it picks the majority
-# side but silently places the minority-side radars in Pakistan.
-#
-# Fix: determine the sign PER RADAR by checking whether the local
-# normal (ty, -tx) points toward a known Indian reference point
-# (Amritsar). The dot product of the normal with the direction from
-# the border point to the reference gives a robust, per-point answer
-# that doesn't degrade with distance (unlike comparing candidate
-# distances, which fails when the reference is far away and the 2 km
-# offset is negligible).
+def load_radar_placement(path):
+    """
+    Loads a JSON list of radar dicts (schema produced by
+    optimize_placement.py's write_placement_json(), identical to what this
+    script itself used to build in-memory as `radars`). Validates every
+    radar has all required fields -- fail-fast, naming the offending radar
+    (by its list index and name, if present) and the missing field(s),
+    since a malformed radar_meta_optimized.json would otherwise surface as
+    a confusing KeyError deep inside STEP 5.
+    """
+    with open(path) as f:
+        radars = json.load(f)
 
-REFERENCE_INDIA_LONLAT = (74.8723, 31.6340)  # Amritsar, India -- close to
-                                              # this border, unambiguously
-                                              # on the Indian side
+    if not isinstance(radars, list):
+        raise RuntimeError(
+            f"{path} must contain a JSON list of radar dicts "
+            f"(got {type(radars).__name__})."
+        )
+    if len(radars) == 0:
+        raise RuntimeError(f"{path} contains zero radars -- nothing to build a matrix for.")
 
-ref_gdf = gpd.GeoDataFrame(
-    geometry=[Point(REFERENCE_INDIA_LONLAT)], crs="EPSG:4326"
-).to_crs(epsg=TARGET_EPSG)
-ref_pt = ref_gdf.geometry.iloc[0]
+    for idx, r in enumerate(radars):
+        missing = [field for field in REQUIRED_RADAR_FIELDS if field not in r]
+        if missing:
+            label = r.get("name", f"index {idx}")
+            raise RuntimeError(
+                f"Radar '{label}' in {path} is missing required field(s): {missing}. "
+                f"Expected schema: {list(REQUIRED_RADAR_FIELDS)}. "
+                "This file is produced by optimize_placement.py -- if it was "
+                "hand-edited or came from an older/incompatible run, regenerate it."
+            )
 
-print(f"\n[2.5] India-side reference point: Amritsar "
-      f"({REFERENCE_INDIA_LONLAT[0]}, {REFERENCE_INDIA_LONLAT[1]})")
-print(f"    Sign will be determined per-radar via dot product with local normal")
+    return radars
 
 
-print(f"\n[3] Deploying {len(RADAR_SPECS)} radars at {INLAND_M} m inland ...")
-radars_xy = []
-for spec in RADAR_SPECS:
-    # Compute the local normal at this position along the border
-    d      = spec["pos_pct"] * line.length
-    pt     = line.interpolate(d)
-    eps    = min(1.0, line.length * 0.001)
-    pt_fwd = line.interpolate(min(d + eps, line.length))
-    pt_bwd = line.interpolate(max(d - eps, 0.0))
-    tx = pt_fwd.x - pt_bwd.x
-    ty = pt_fwd.y - pt_bwd.y
-    t_len = math.hypot(tx, ty)
-    if t_len > 0:
-        tx /= t_len; ty /= t_len
-    nx, ny = ty, -tx
+def load_type_config(path):
+    """
+    Loads radar_type_config.json (schema produced by optimize_placement.py's
+    write_type_config_json()): a dict keyed by type name, each value holding
+    count/range_m/h_ant/theta_min/theta_max/az_halfwidth/energy_budget/
+    cooling_L/cooling_C. Only theta_min/theta_max/az_halfwidth are consumed
+    by this script (in STEP 5, gated on ENABLE_FOV_CHECK/ENABLE_AZIMUTH_CHECK)
+    -- h_ant/range_m/count/energy_budget/cooling_L/cooling_C are irrelevant
+    here (h_ant is already baked into each radar's loaded "z" field; the rest
+    are scheduler-only config).
+    """
+    with open(path) as f:
+        type_config = json.load(f)
 
-    # Dot product of normal with direction toward Amritsar tells us
-    # which sign pushes the radar toward India.
-    vx = ref_pt.x - pt.x
-    vy = ref_pt.y - pt.y
-    dot = nx * vx + ny * vy
-    sign = 1.0 if dot > 0 else -1.0
+    if not isinstance(type_config, dict):
+        raise RuntimeError(
+            f"{path} must contain a JSON object keyed by type name "
+            f"(got {type(type_config).__name__})."
+        )
+    return type_config
 
-    rpt = inland_point(line, spec["pos_pct"], INLAND_M, sign=sign)
-    radars_xy.append({
-        "name":    spec["name"],
-        "x":       rpt.x,
-        "y":       rpt.y,
-        "range_m": spec["range_m"],
-        "type":    spec["type"],
-    })
+
+print(f"\n[3] Loading radar placement from {INPUT_PLACEMENT} ...")
+radars = load_radar_placement(INPUT_PLACEMENT)
+print(f"    Loaded {len(radars)} radars (placement already computed by optimize_placement.py)")
+
+print(f"    Loading per-type FOV/azimuth config from {INPUT_TYPE_CONFIG} ...")
+type_config = load_type_config(INPUT_TYPE_CONFIG)
+print(f"    Loaded config for {len(type_config)} type(s): {sorted(type_config.keys())}")
 
 
 # ══════════════════════════════════════════════════════════════
-#  STEP 4 — DEM-DERIVE Z FOR RADARS AND BOUNDARY POINTS
-#  New in v1.3. z_i = DEM(x_i,y_i) + h_ant ; z_j = DEM(x_j,y_j) + H_TARGET
+#  STEP 4 — DEM-DERIVE Z FOR BOUNDARY POINTS
+#  Radar elevations (ground_z, h_ant, z) are no longer computed here --
+#  they arrive already-populated in the loaded radar list (STEP 3), computed
+#  once by optimize_placement.py. Only boundary-point elevations still need
+#  a DEM pass: z_j = DEM(x_j,y_j) + H_TARGET.
 # ══════════════════════════════════════════════════════════════
 
 print(f"\n[4] Loading DEM and assigning elevations ...")
 dem = DEMReader(DEM_FILE, target_epsg=TARGET_EPSG)
-
-radar_xs = np.array([r["x"] for r in radars_xy])
-radar_ys = np.array([r["y"] for r in radars_xy])
-radar_ground_z = dem.elevations(radar_xs, radar_ys)
-
-radars = []
-for r, gz in zip(radars_xy, radar_ground_z):
-    h_ant = H_ANT_BY_TYPE[r["type"]]
-    radars.append({**r, "ground_z": float(gz), "h_ant": h_ant, "z": float(gz + h_ant)})
 
 bpt_xs = np.array([p.x for p in bpts])
 bpt_ys = np.array([p.y for p in bpts])
 bpt_ground_z = dem.elevations(bpt_xs, bpt_ys)
 bpt_z = bpt_ground_z + H_TARGET   # z_j, per point
 
-print(f"    Radar elevations   : {radar_ground_z.min():.1f} – {radar_ground_z.max():.1f} m (ground)")
 print(f"    Boundary elevations: {bpt_ground_z.min():.1f} – {bpt_ground_z.max():.1f} m (ground)")
 
-small  = sum(1 for r in radars if r["type"] == "Small")
-medium = sum(1 for r in radars if r["type"] == "Medium")
-large  = sum(1 for r in radars if r["type"] == "Large")
-print(f"    {large} × Large  |  {medium} × Medium  |  {small} × Small")
+radar_ground_z = np.array([r["ground_z"] for r in radars])
+print(f"    Radar elevations   : {radar_ground_z.min():.1f} – {radar_ground_z.max():.1f} m "
+      f"(ground, loaded from {INPUT_PLACEMENT})")
+
+type_counts = {}
+for r in radars:
+    type_counts[r["type"]] = type_counts.get(r["type"], 0) + 1
+print("    " + "  |  ".join(f"{n} × {t}" for t, n in sorted(type_counts.items())))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -559,7 +613,8 @@ print(f"    {large} × Large  |  {medium} × Medium  |  {small} × Small")
 
 print(f"\n[5] Building {len(radars)} × {len(bpts)} 3D coverage matrix ...")
 print(f"    Earth curvature : {'ON' if ENABLE_EARTH_CURVATURE else 'OFF'}")
-print(f"    FOV check       : {'ON' if ENABLE_FOV_CHECK else 'OFF (pending professor input)'}")
+print(f"    FOV (elevation) : {'ON' if ENABLE_FOV_CHECK else 'OFF (pending professor input)'}")
+print(f"    FOV (azimuth)   : {'ON' if ENABLE_AZIMUTH_CHECK else 'OFF (pending professor input)'}")
 
 C_matrix = []
 total_coverage_cells = 0
@@ -578,16 +633,39 @@ for radar in radars:
 
     row = [0] * len(bpts)
 
+    if ENABLE_FOV_CHECK or ENABLE_AZIMUTH_CHECK:
+        rtype = radar["type"]
+        if rtype not in type_config:
+            raise RuntimeError(
+                f"Radar '{radar['name']}' has type '{rtype}', which is not a key in "
+                f"{INPUT_TYPE_CONFIG} (available types: {sorted(type_config.keys())}). "
+                f"{INPUT_PLACEMENT} and {INPUT_TYPE_CONFIG} are inconsistent with each "
+                "other -- they must come from the same optimize_placement.py run. "
+                "Regenerate both together."
+            )
+
     if ENABLE_FOV_CHECK:
-        theta_min = THETA_MIN_BY_TYPE[radar["type"]]
-        theta_max = THETA_MAX_BY_TYPE[radar["type"]]
+        theta_min = type_config[rtype]["theta_min"]
+        theta_max = type_config[rtype]["theta_max"]
+
+    if ENABLE_AZIMUTH_CHECK:
+        boresight_deg = radar["boresight_deg"]
+        az_halfwidth = type_config[rtype]["az_halfwidth"]
 
     for j in candidates:
         d_h = d_horiz_all[j]
 
-        # Condition 3: FOV (cheap — check before the ray march)
+        # Condition 3a: elevation FOV (cheap — check before the ray march)
         if ENABLE_FOV_CHECK:
             if not in_fov(rz, bpt_z[j], d_h, theta_min, theta_max):
+                continue
+
+        # Condition 3b: azimuth FOV (cheap — check before the ray march).
+        # Independent toggle from elevation: a radar can have a full
+        # vertical window but still be a directional/sector antenna
+        # horizontally, or vice versa.
+        if ENABLE_AZIMUTH_CHECK:
+            if not in_azimuth(dx[j], dy[j], boresight_deg, az_halfwidth):
                 continue
 
         # Condition 2: LOS (expensive — ray march against DEM)
@@ -627,6 +705,6 @@ print(f"    Saved matrix   → {OUTPUT_MATRIX}  "
 
 with open(OUTPUT_META, "w") as f:
     json.dump(radars, f, indent=2)
-print(f"    Saved metadata → {OUTPUT_META}  (now includes ground_z, h_ant, z per radar)")
+print(f"    Saved metadata → {OUTPUT_META}  (pass-through re-export of {INPUT_PLACEMENT}, same schema)")
 
 print(f"\n[Done]  Run scheduler_1.2.py next — c_matrix.json format is unchanged.\n")

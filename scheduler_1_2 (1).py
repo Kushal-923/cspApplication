@@ -3,10 +3,16 @@ scheduler_1.2.py  —  Two-Phase CSP / ILP Radar Scheduler
 =========================================================
 
 Changes over v1.1:
-  1. BUDGETS are auto-generated from radar metadata (no hardcoded list).
-     Budget rule: Large=18, Medium=16, Small=12 active slots out of M=24.
-     Override by editing BUDGET_BY_TYPE below.
-  2. NUM_TIME_SLOTS (M) is still editable — default stays 24.
+  1. BUDGETS and cooling (L, C) are no longer hardcoded or name-substring-
+     matched — they are loaded per-radar-type from radar_type_config.json
+     (produced by optimize_placement.py), looked up by an EXACT match on
+     each radar's "type" field (via assign_budgets_and_cooling()). Energy
+     budget, cooling_L, and cooling_C are now genuinely per-type: different
+     radar types can have different cooling windows, not just different
+     budgets. Missing radar_meta.json or radar_type_config.json is now a
+     hard RuntimeError at startup -- there is no hardcoded fallback.
+  2. NUM_TIME_SLOTS (M) is still editable — default stays 24. Hand-edit
+     this yourself; it is not sourced from any JSON file.
   3. Prints coverage statistics before solving (how many points each radar
      covers, what fraction of the border is reachable at all).
   4. Minor: status summary prints void % and overlap density for easier
@@ -14,38 +20,35 @@ Changes over v1.1:
 
 Algorithm is unchanged — see scheduler_1.1.py for full documentation.
 
-Input files:
-  c_matrix.json     — built by build_matrix_1.2.py
-  radar_meta.json   — built by build_matrix_1.2.py
+Input files (all REQUIRED — no hardcoded fallback if missing):
+  c_matrix.json          — built by build_matrix_1.3.py
+  radar_meta.json        — built by build_matrix_1.3.py
+  radar_type_config.json — built by optimize_placement.py (per-type
+                            energy_budget/cooling_L/cooling_C, looked up
+                            by exact match on each radar's "type" field)
 """
 
 import json
+import sys
 from ortools.sat.python import cp_model
+
+# Console output below uses box-drawing/checkmark characters -- force
+# UTF-8 on stdout so this doesn't crash under a plain Windows console
+# (cp1252), which can't encode them.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 # ══════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ══════════════════════════════════════════════════════════════
 
-MATRIX_FILE = "c_matrix.json"
-META_FILE   = "radar_meta.json"
+MATRIX_FILE      = "c_matrix.json"
+META_FILE        = "radar_meta.json"
+TYPE_CONFIG_FILE = "radar_type_config.json"
 
 NUM_TIME_SLOTS = 24   # M — 24 hourly slots = one full day
-
-# Cooling constraint
-#   In any rolling window of (L + C_COOL) slots,
-#   a radar may be ON for at most L slots.
-L      = 3
-C_COOL = 2    # window = 5: at most 3 ON per 5 consecutive slots
-
-# Energy budget per radar type (max total ON-slots over all M slots).
-# Keyed on the substring that appears in the radar name.
-# Edit these to match your hardware thermal specs.
-BUDGET_BY_TYPE = {
-    "Large":  18,   # can run 18 out of 24 hours
-    "Medium": 16,
-    "Small":  12,
-}
-DEFAULT_BUDGET = 14   # fallback if name matches none of the above
+                      # Hand-edit this yourself; not sourced from any JSON
+                      # file and not tied to region/radar type.
 
 TIME_LIMIT = 300.0    # seconds per solver phase — increase for large K
 
@@ -71,33 +74,69 @@ def status_label(code):
     }.get(code, "UNKNOWN")
 
 
-def assign_budgets(meta, M):
+def load_type_config(path):
     """
-    Derive per-radar energy budget from radar name.
-    Also enforces budget <= M (can't be on more than M slots).
+    Loads radar_type_config.json (schema produced by optimize_placement.py's
+    write_type_config_json()): a dict keyed by type name, each value holding
+    count/range_m/h_ant/theta_min/theta_max/az_halfwidth/energy_budget/
+    cooling_L/cooling_C. Only energy_budget/cooling_L/cooling_C are consumed
+    here.
     """
-    budgets = []
+    with open(path) as f:
+        type_config = json.load(f)
+    if not isinstance(type_config, dict):
+        raise RuntimeError(
+            f"{path} must contain a JSON object keyed by type name "
+            f"(got {type(type_config).__name__})."
+        )
+    return type_config
+
+
+def assign_budgets_and_cooling(meta, type_config, M):
+    """
+    Derive per-radar energy_budget/cooling_L/cooling_C from
+    radar_type_config.json via an EXACT lookup on each radar's "type" field
+    (not a substring match on "name"). Also enforces budget <= M.
+
+    Explicitly casts to int -- energy_budget arrives as a JSON float from
+    optimize_placement.py's wizard (collected via a float prompt), but
+    CP-SAT constraint bounds require int.
+
+    Returns three parallel per-radar lists: (budgets, L_list, C_list).
+    """
+    budgets, L_list, C_list = [], [], []
     for r in meta:
-        b = DEFAULT_BUDGET
-        for key, val in BUDGET_BY_TYPE.items():
-            if key in r["name"]:
-                b = val
-                break
-        budgets.append(min(b, M))
-    return budgets
+        rtype = r["type"]
+        if rtype not in type_config:
+            raise RuntimeError(
+                f"Radar '{r['name']}' has type '{rtype}', which is not a key in "
+                f"{TYPE_CONFIG_FILE} (available types: {sorted(type_config.keys())}). "
+                f"{META_FILE} and {TYPE_CONFIG_FILE} are inconsistent with each "
+                "other -- they must come from the same optimize_placement.py run. "
+                "Regenerate both together."
+            )
+        cfg = type_config[rtype]
+        budgets.append(min(int(round(cfg["energy_budget"])), M))
+        L_list.append(int(cfg["cooling_L"]))
+        C_list.append(int(cfg["cooling_C"]))
+    return budgets, L_list, C_list
 
 
-def add_cooling_and_energy(model, X, N, M, L, C_cool, B):
+def add_cooling_and_energy(model, X, N, M, L_list, C_list, B):
     """
-    Cooling  : Σ_{k=t}^{min(t+L+C-1, M-1)} X[i,k]  ≤  L   ∀ i, t
-    Energy   : Σ_t X[i,t]                            ≤  B[i] ∀ i
+    Cooling  : per-radar rolling-window ON cap -- for radar i, in any window
+               of (L_list[i] + C_list[i]) consecutive slots, X may be ON for
+               at most L_list[i] of them. Now genuinely per-radar/per-type
+               (was a single global L/C_COOL applied uniformly to every
+               radar regardless of type).
+    Energy   : Σ_t X[i,t]  ≤  B[i]  ∀ i
     """
-    window = L + C_cool
-    if window > 1:
-        for i in range(N):
+    for i in range(N):
+        window = L_list[i] + C_list[i]
+        if window > 1:
             for t in range(M):
                 end = min(t + window, M)
-                model.Add(sum(X[i][k] for k in range(t, end)) <= L)
+                model.Add(sum(X[i][k] for k in range(t, end)) <= L_list[i])
     for i in range(N):
         model.Add(sum(X[i][t] for t in range(M)) <= B[i])
 
@@ -147,7 +186,7 @@ def print_coverage_stats(C_mat, N, K):
 #  STEP 0 — PURE CSP FEASIBILITY CHECK
 # ══════════════════════════════════════════════════════════════
 
-def step0_feasibility(C_mat, N, K, M, L, C_cool, B, time_limit):
+def step0_feasibility(C_mat, N, K, M, L_list, C_list, B, time_limit):
     banner("STEP 0 — Feasibility Check (pure CSP)",
            "Can every point be covered at every slot?")
 
@@ -159,7 +198,7 @@ def step0_feasibility(C_mat, N, K, M, L, C_cool, B, time_limit):
         for t in range(M):
             model.Add(sum(C_mat[i][j] * X[i][t] for i in range(N)) >= 1)
 
-    add_cooling_and_energy(model, X, N, M, L, C_cool, B)
+    add_cooling_and_energy(model, X, N, M, L_list, C_list, B)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
@@ -180,7 +219,7 @@ def step0_feasibility(C_mat, N, K, M, L, C_cool, B, time_limit):
 #  PHASE 1 — MINIMISE VOID
 # ══════════════════════════════════════════════════════════════
 
-def phase1_min_void(C_mat, N, K, M, L, C_cool, B, time_limit):
+def phase1_min_void(C_mat, N, K, M, L_list, C_list, B, time_limit):
     banner("PHASE 1 — Minimise Void",
            "Full coverage impossible. Finding minimum-void schedule.")
 
@@ -195,7 +234,7 @@ def phase1_min_void(C_mat, N, K, M, L, C_cool, B, time_limit):
             cov = sum(C_mat[i][j] * X[i][t] for i in range(N))
             model.Add(cov >= 1 - V[j][t])
 
-    add_cooling_and_energy(model, X, N, M, L, C_cool, B)
+    add_cooling_and_energy(model, X, N, M, L_list, C_list, B)
     model.Minimize(sum(V[j][t] for j in range(K) for t in range(M)))
 
     solver = cp_model.CpSolver()
@@ -233,7 +272,7 @@ def phase1_min_void(C_mat, N, K, M, L, C_cool, B, time_limit):
 #  PHASE 2 — MINIMISE OVERLAP
 # ══════════════════════════════════════════════════════════════
 
-def phase2_min_overlap(C_mat, N, K, M, L, C_cool, B, time_limit):
+def phase2_min_overlap(C_mat, N, K, M, L_list, C_list, B, time_limit):
     banner("PHASE 2 — Minimise Overlap",
            "Hard coverage enforced. Minimising redundant radar coverage.")
 
@@ -249,7 +288,7 @@ def phase2_min_overlap(C_mat, N, K, M, L, C_cool, B, time_limit):
             model.Add(cov >= 1)
             model.Add(O[j][t] >= cov - 1)
 
-    add_cooling_and_energy(model, X, N, M, L, C_cool, B)
+    add_cooling_and_energy(model, X, N, M, L_list, C_list, B)
     model.Minimize(sum(O[j][t] for j in range(K) for t in range(M)))
 
     solver = cp_model.CpSolver()
@@ -304,37 +343,60 @@ if __name__ == "__main__":
     K = len(C_mat[0])
     M = NUM_TIME_SLOTS
 
-    # ── Load metadata ─────────────────────────────────────────
-    meta = None
+    # ── Load metadata (now REQUIRED — no more "generic radar names"
+    #    fallback, since budgets/cooling can no longer be derived without
+    #    it) ──────────────────────────────────────────────────
     try:
         with open(META_FILE) as f:
             meta = json.load(f)
-        print(f"    Loaded radar metadata: {len(meta)} radars")
-    except Exception:
-        print("    (No metadata file — using generic radar names)")
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"{META_FILE} not found. This scheduler now requires {META_FILE} "
+            f"(for radar type lookup) and {TYPE_CONFIG_FILE} (for per-type "
+            "energy_budget/cooling_L/cooling_C) -- there is no more hardcoded "
+            "fallback. Run build_matrix_1.3.py first to produce it."
+        )
+    print(f"    Loaded radar metadata: {len(meta)} radars")
 
-    # ── Derive budgets ────────────────────────────────────────
-    if meta:
-        BUDGETS = assign_budgets(meta, M)
-    else:
-        BUDGETS = [DEFAULT_BUDGET] * N
+    # ── Load per-type config ──────────────────────────────────
+    try:
+        type_config = load_type_config(TYPE_CONFIG_FILE)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"{TYPE_CONFIG_FILE} not found. This scheduler now requires "
+            f"{TYPE_CONFIG_FILE} for per-type energy_budget/cooling_L/cooling_C "
+            "-- there is no more hardcoded fallback. Run optimize_placement.py "
+            "first to produce it."
+        )
+    print(f"    Loaded config for {len(type_config)} type(s): {sorted(type_config.keys())}")
+
+    # ── Derive budgets + cooling ───────────────────────────────
+    BUDGETS, L_LIST, C_LIST = assign_budgets_and_cooling(meta, type_config, M)
 
     # ── Parameter summary ─────────────────────────────────────
     print(f"\n  N = {N} radars")
     print(f"  K = {K} boundary points")
     print(f"  M = {M} time slots")
-    print(f"  L = {L},  C = {C_COOL}  (window = {L + C_COOL})")
+    cooling_counts = {}
+    for l_val, c_val in zip(L_LIST, C_LIST):
+        cooling_counts[(l_val, c_val)] = cooling_counts.get((l_val, c_val), 0) + 1
+    cooling_summary = ", ".join(
+        f"(L={l_val},C={c_val})×{count}"
+        for (l_val, c_val), count in sorted(cooling_counts.items())
+    )
+    print(f"  Cooling (L,C) by radar: {cooling_summary}  (per-type, from {TYPE_CONFIG_FILE})")
     budget_counts = {}
     for b in BUDGETS:
         budget_counts[b] = budget_counts.get(b, 0) + 1
     print(f"  B = {dict(sorted(budget_counts.items()))}  (budget → radar count)")
     print(f"  Time limit per phase: {TIME_LIMIT}s")
 
-    # Validate budget list
-    if len(BUDGETS) != N:
+    # Validate budget/cooling lists
+    if len(BUDGETS) != N or len(L_LIST) != N or len(C_LIST) != N:
         raise ValueError(
-            f"BUDGETS has {len(BUDGETS)} entries but N={N} radars. "
-            "Check assign_budgets() or BUDGET_BY_TYPE."
+            f"BUDGETS/L_LIST/C_LIST have {len(BUDGETS)}/{len(L_LIST)}/{len(C_LIST)} "
+            f"entries but N={N} radars. Check assign_budgets_and_cooling() or "
+            f"{TYPE_CONFIG_FILE}."
         )
 
     # ── Coverage stats ────────────────────────────────────────
@@ -346,13 +408,13 @@ if __name__ == "__main__":
         )
 
     # ── Step 0 ────────────────────────────────────────────────
-    result = step0_feasibility(C_mat, N, K, M, L, C_COOL, BUDGETS, TIME_LIMIT)
+    result = step0_feasibility(C_mat, N, K, M, L_LIST, C_LIST, BUDGETS, TIME_LIMIT)
 
     # ── Branch ────────────────────────────────────────────────
     if result == "FEASIBLE":
-        output = phase2_min_overlap(C_mat, N, K, M, L, C_COOL, BUDGETS, TIME_LIMIT)
+        output = phase2_min_overlap(C_mat, N, K, M, L_LIST, C_LIST, BUDGETS, TIME_LIMIT)
     else:
-        output = phase1_min_void(C_mat, N, K, M, L, C_COOL, BUDGETS, TIME_LIMIT)
+        output = phase1_min_void(C_mat, N, K, M, L_LIST, C_LIST, BUDGETS, TIME_LIMIT)
 
     # ── Print schedule ────────────────────────────────────────
     if "schedule" in output:
@@ -374,3 +436,6 @@ if __name__ == "__main__":
         print(f"  Overlap density : {output.get('overlap_density', 0):.4f}")
         print(f"  Total void      : 0 (guaranteed by hard constraint)")
     print()
+
+    with open("schedule_output.json", "w") as f:
+        json.dump(output, f)
