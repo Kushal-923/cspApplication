@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Radar Deployment — 2D Map Visualizer</title>
+    <meta name="description" content="Interactive 2D map visualizer for Punjab border radar deployment positions with 24-hour schedule playback.">
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+          crossorigin="" />
+
+    <!-- App CSS -->
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay">
+        <div class="loading-spinner"></div>
+        <div class="loading-text">Loading radar data…</div>
+    </div>
+
+    <!-- Header -->
+    <div id="header">
+        <div class="icon">📡</div>
+        <div>
+            <div class="title">Radar Deployment Map</div>
+            <div class="subtitle">Punjab Border — 2D Overview</div>
+        </div>
+        <div class="stats">
+            <div class="stat-item">
+                <div class="stat-value" id="stat-total">—</div>
+                <div class="stat-label">Radars</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="stat-large">—</div>
+                <div class="stat-label">Large</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="stat-medium">—</div>
+                <div class="stat-label">Medium</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="stat-small">—</div>
+                <div class="stat-label">Small</div>
+            </div>
+            <div class="stat-item" id="stat-active-wrap" style="display:none">
+                <div class="stat-value" id="stat-active" style="color:#4ade80">—</div>
+                <div class="stat-label">Active</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main layout: map left, panels right -->
+    <div id="main-layout">
+
+        <!-- Left: Leaflet map -->
+        <div id="map"></div>
+
+        <!-- Right: controls panel (top), radar list panel (bottom) -->
+        <div id="right-col">
+
+            <!-- Schedule Playback Panel -->
+            <div id="schedule-panel">
+                <div class="panel-header">
+                    <span class="panel-icon">🕐</span>
+                    <span class="panel-title">24-Hour Schedule Playback</span>
+                    <span class="panel-phase" id="sched-phase-badge" style="display:none"></span>
+                </div>
+
+                <!-- No-schedule message -->
+                <div id="sched-missing" class="sched-missing" style="display:none">
+                    <div class="sched-missing-icon">⚠️</div>
+                    <div class="sched-missing-title">No schedule found</div>
+                    <div class="sched-missing-msg">Run <code>scheduler_1_3.py</code> to generate a schedule, then restart the visualizer.</div>
+                </div>
+
+                <!-- Playback UI -->
+                <div id="sched-ui" style="display:none">
+                    <!-- Hour display + count -->
+                    <div class="sched-hour-row">
+                        <div class="sched-hour-display">
+                            <span class="sched-hour-label">Hour</span>
+                            <span class="sched-hour-value" id="sched-hour-val">00:00</span>
+                        </div>
+                        <div class="sched-active-display">
+                            <span class="sched-active-count" id="sched-active-count">—</span>
+                            <span class="sched-active-label">radars active</span>
+                        </div>
+                    </div>
+
+                    <!-- Slider -->
+                    <div class="sched-slider-row">
+                        <span class="sched-slider-tick">0</span>
+                        <input type="range" id="sched-slider" min="0" max="23" value="0" step="1" class="sched-slider">
+                        <span class="sched-slider-tick">23</span>
+                    </div>
+
+                    <!-- Controls -->
+                    <div class="sched-controls">
+                        <button class="sched-btn" id="sched-prev" title="Previous hour">◀</button>
+                        <button class="sched-btn sched-btn-play" id="sched-play" title="Play/Pause">▶ Play</button>
+                        <button class="sched-btn" id="sched-next" title="Next hour">▶</button>
+                        <div class="sched-speed-wrap">
+                            <span class="sched-speed-label">Speed</span>
+                            <select id="sched-speed" class="sched-speed-select">
+                                <option value="2000">0.5×</option>
+                                <option value="1000" selected>1×</option>
+                                <option value="500">2×</option>
+                                <option value="250">4×</option>
+                            </select>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
+            <!-- Bottom-right: radar status list panel -->
+            <div id="radar-list-panel">
+                <div class="panel-header radar-list-header">
+                    <span class="panel-icon">📋</span>
+                    <span class="panel-title">Radar Status at Hour</span>
+                    <span class="radar-list-count" id="radar-list-count"></span>
+                </div>
+                <div id="sched-missing-list" class="sched-missing-small" style="display:none">
+                    Run <code>scheduler_1_3.py</code> to see live status
+                </div>
+                <div class="sched-grid" id="sched-grid">
+                    <!-- populated by JS -->
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+            crossorigin=""></script>
+
+    <script>
+    // ══════════════════════════════════════════════════════════
+    //  CONFIG
+    // ══════════════════════════════════════════════════════════
+
+    const RADAR_COLORS = {
+        Large:  { fill: '#ef4444', stroke: '#fca5a5', range: 'rgba(239, 68, 68, 0.08)',  rangeStroke: 'rgba(239, 68, 68, 0.3)'  },
+        Medium: { fill: '#f59e0b', stroke: '#fcd34d', range: 'rgba(245, 158, 11, 0.08)', rangeStroke: 'rgba(245, 158, 11, 0.3)' },
+        Small:  { fill: '#06b6d4', stroke: '#67e8f9', range: 'rgba(6, 182, 212, 0.08)',  rangeStroke: 'rgba(6, 182, 212, 0.3)'  },
+    };
+
+    const RADAR_COLORS_DIM = {
+        Large:  { fill: '#4b1515', stroke: '#7f1d1d', range: 'rgba(239, 68, 68, 0.02)',  rangeStroke: 'rgba(239, 68, 68, 0.08)'  },
+        Medium: { fill: '#4b3a0a', stroke: '#78350f', range: 'rgba(245, 158, 11, 0.02)', rangeStroke: 'rgba(245, 158, 11, 0.08)' },
+        Small:  { fill: '#083344', stroke: '#164e63', range: 'rgba(6, 182, 212, 0.02)',  rangeStroke: 'rgba(6, 182, 212, 0.08)'  },
+    };
+
+    const RADAR_RADII = { Large: 10, Medium: 8, Small: 6 };
+
+    const BORDER_STYLE = {
+        color: '#a78bfa',
+        weight: 3,
+        opacity: 0.85,
+        dashArray: '8, 6',
+        lineCap: 'round',
+    };
+
+    // ══════════════════════════════════════════════════════════
+    //  MAP INIT
+    // ══════════════════════════════════════════════════════════
+
+    const map = L.map('map', {
+        zoomControl: false,
+        attributionControl: true,
+    }).setView([31.5, 74.5], 8);
+
+    L.control.zoom({ position: 'topright' }).addTo(map);
+
+    const darkTiles = L.tileLayer(
+        'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
+        subdomains: 'abcd',
+        maxZoom: 19,
+    });
+
+    const satellite = L.tileLayer(
+        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        attribution: '&copy; Esri',
+        maxZoom: 19,
+    });
+
+    darkTiles.addTo(map);
+    L.control.layers({ 'Dark': darkTiles, 'Satellite': satellite }, null, { position: 'topright' }).addTo(map);
+
+    const borderLayer = L.layerGroup().addTo(map);
+    const rangeLayer  = L.layerGroup().addTo(map);
+    const radarLayer  = L.layerGroup().addTo(map);
+
+    // ══════════════════════════════════════════════════════════
+    //  POPUP BUILDER
+    // ══════════════════════════════════════════════════════════
+
+    function formatValue(val, unit) {
+        if (val === null || val === undefined) {
+            return '<span class="radar-popup-value na">not yet available</span>';
+        }
+        const display = unit ? `${val} ${unit}` : val;
+        return `<span class="radar-popup-value">${display}</span>`;
+    }
+
+    function buildPopupHTML(props) {
+        const typeClass = props.type.toLowerCase();
+        const rangeKm = (props.range_m / 1000).toFixed(0);
+        return `
+            <div class="radar-popup">
+                <div class="radar-popup-header">
+                    <span class="radar-type-badge ${typeClass}">${props.type}</span>
+                    <span class="radar-popup-name">${props.name}</span>
+                </div>
+                <div class="radar-popup-body">
+                    <div class="radar-popup-row">
+                        <span class="radar-popup-label">Latitude</span>
+                        ${formatValue(props.lat, '°')}
+                    </div>
+                    <div class="radar-popup-row">
+                        <span class="radar-popup-label">Longitude</span>
+                        ${formatValue(props.lon, '°')}
+                    </div>
+                    <div class="radar-popup-row">
+                        <span class="radar-popup-label">Range</span>
+                        ${formatValue(rangeKm, 'km')}
+                    </div>
+                    <div class="radar-popup-row">
+                        <span class="radar-popup-label">Type</span>
+                        ${formatValue(props.type)}
+                    </div>
+                    <div class="radar-popup-row">
+                        <span class="radar-popup-label">Frequency</span>
+                        ${formatValue(props.frequency)}
+                    </div>
+                    <div class="radar-popup-row">
+                        <span class="radar-popup-label">Physical Cond.</span>
+                        ${formatValue(props.physical_conditions)}
+                    </div>
+                </div>
+            </div>`;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  DATA: radars & border
+    //  radarObjects[i] = { marker, rangeCircle, props, index }
+    // ══════════════════════════════════════════════════════════
+
+    let radarObjects = [];   // indexed same as RADAR_SPECS / schedule[i]
+
+    async function loadBorder() {
+        const res  = await fetch('/border');
+        const data = await res.json();
+        L.geoJSON(data, {
+            style: () => BORDER_STYLE,
+            onEachFeature: (feature, layer) => {
+                layer.bindTooltip('Punjab Border', { className: 'range-tooltip', sticky: true });
+            },
+        }).addTo(borderLayer);
+    }
+
+    async function loadRadars() {
+        const res  = await fetch('/radars');
+        const data = await res.json();
+        const features = data.features;
+
+        // Header stats
+        document.getElementById('stat-total').textContent  = features.length;
+        document.getElementById('stat-large').textContent  = features.filter(f => f.properties.type === 'Large').length;
+        document.getElementById('stat-medium').textContent = features.filter(f => f.properties.type === 'Medium').length;
+        document.getElementById('stat-small').textContent  = features.filter(f => f.properties.type === 'Small').length;
+
+        features.forEach((feature, i) => {
+            const props  = feature.properties;
+            const latlng = [props.lat, props.lon];
+            const colors = RADAR_COLORS[props.type] || RADAR_COLORS.Small;
+            const radius = RADAR_RADII[props.type] || 6;
+
+            const rangeCircle = L.circle(latlng, {
+                radius: props.range_m,
+                color: colors.rangeStroke,
+                weight: 1.5,
+                fillColor: colors.range,
+                fillOpacity: 1,
+                interactive: false,
+            }).addTo(rangeLayer);
+
+            const marker = L.circleMarker(latlng, {
+                radius: radius,
+                fillColor: colors.fill,
+                color: colors.stroke,
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 0.9,
+            });
+
+            marker.bindPopup(buildPopupHTML(props), { maxWidth: 300, className: '' });
+
+            marker.on('mouseover', function () { this.setStyle({ radius: radius + 3, weight: 3 }); });
+            marker.on('mouseout',  function () { this.setStyle({ radius: radius, weight: 2 }); });
+
+            marker.addTo(radarLayer);
+
+            radarObjects.push({ marker, rangeCircle, props, index: i });
+        });
+
+        if (features.length > 0) {
+            const bounds = L.latLngBounds(features.map(f => [f.properties.lat, f.properties.lon]));
+            map.fitBounds(bounds.pad(0.15), { paddingTopLeft: [0, 60] });
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  LEGEND (bottom-left so it clears the schedule panel)
+    // ══════════════════════════════════════════════════════════
+
+    const legend = L.control({ position: 'bottomleft' });
+    legend.onAdd = function () {
+        const div = L.DomUtil.create('div', 'legend-panel');
+        div.innerHTML = `
+            <div class="legend-title">Legend</div>
+            <div class="legend-item">
+                <div class="legend-dot large"></div>
+                <span class="legend-label">Large</span>
+                <span class="legend-range">15 km</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-dot medium"></div>
+                <span class="legend-label">Medium</span>
+                <span class="legend-range">10 km</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-dot small"></div>
+                <span class="legend-label">Small</span>
+                <span class="legend-range">5 km</span>
+            </div>
+            <div class="legend-divider"></div>
+            <div class="legend-border-item">
+                <div class="legend-border-line"></div>
+                <span class="legend-label">Border</span>
+            </div>
+        `;
+        return div;
+    };
+    legend.addTo(map);
+
+    // ══════════════════════════════════════════════════════════
+    //  SCHEDULE PANEL
+    // ══════════════════════════════════════════════════════════
+
+    let scheduleData  = null;   // { N, M, phase, status, schedule: [[int]] }
+    let currentHour   = 0;
+    let playInterval  = null;
+    let isPlaying     = false;
+
+    function hourLabel(h) {
+        return `${String(h).padStart(2, '0')}:00`;
+    }
+
+    function applyHour(hour) {
+        currentHour = hour;
+        document.getElementById('sched-slider').value = hour;
+        document.getElementById('sched-hour-val').textContent = hourLabel(hour);
+
+        if (!scheduleData) return;
+
+        const sched = scheduleData.schedule;  // sched[i][t]
+        const N     = sched.length;
+        let activeCount = 0;
+
+        radarObjects.forEach((obj, i) => {
+            if (i >= N) return;
+            const isOn = sched[i][hour] === 1;
+            if (isOn) activeCount++;
+
+            const type   = obj.props.type;
+            const radius = RADAR_RADII[type] || 6;
+            const onColors  = RADAR_COLORS[type]     || RADAR_COLORS.Small;
+            const offColors = RADAR_COLORS_DIM[type] || RADAR_COLORS_DIM.Small;
+            const c = isOn ? onColors : offColors;
+
+            obj.marker.setStyle({
+                fillColor:   c.fill,
+                color:       c.stroke,
+                opacity:     isOn ? 1.0 : 0.35,
+                fillOpacity: isOn ? 0.9 : 0.2,
+            });
+            obj.rangeCircle.setStyle({
+                color:       c.rangeStroke,
+                fillColor:   c.range,
+                opacity:     isOn ? 1.0 : 0.25,
+                fillOpacity: isOn ? 1.0 : 0.3,
+            });
+
+            // Update grid cell
+            const cell = document.getElementById(`sched-cell-${i}`);
+            if (cell) {
+                cell.className = 'sched-cell ' + (isOn ? 'on' : 'off');
+                cell.querySelector('.sched-cell-status').textContent = isOn ? 'ON' : 'OFF';
+            }
+        });
+
+        // Update active count
+        document.getElementById('sched-active-count').textContent = `${activeCount}/${N}`;
+        const listCount = document.getElementById('radar-list-count');
+        if (listCount) listCount.textContent = `${activeCount} / ${N} active`;
+        const statWrap = document.getElementById('stat-active-wrap');
+        if (statWrap) {
+            statWrap.style.display = '';
+            document.getElementById('stat-active').textContent = activeCount;
+        }
+    }
+
+    function buildGrid(radarList) {
+        const grid = document.getElementById('sched-grid');
+        grid.innerHTML = '';
+        radarList.forEach((obj, i) => {
+            const cell = document.createElement('div');
+            cell.className = 'sched-cell off';
+            cell.id = `sched-cell-${i}`;
+            const typeClass = (obj.props.type || 'Small').toLowerCase();
+            cell.innerHTML = `
+                <span class="sched-cell-dot ${typeClass}"></span>
+                <span class="sched-cell-name">${obj.props.name}</span>
+                <span class="sched-cell-status">OFF</span>
+            `;
+            grid.appendChild(cell);
+        });
+    }
+
+    function startPlayback() {
+        const speed = parseInt(document.getElementById('sched-speed').value, 10);
+        isPlaying = true;
+        document.getElementById('sched-play').textContent = '⏸ Pause';
+        playInterval = setInterval(() => {
+            const next = (currentHour + 1) % 24;
+            applyHour(next);
+        }, speed);
+    }
+
+    function stopPlayback() {
+        isPlaying = false;
+        document.getElementById('sched-play').textContent = '▶ Play';
+        if (playInterval) { clearInterval(playInterval); playInterval = null; }
+    }
+
+    async function loadSchedule() {
+        let data;
+        try {
+            const res = await fetch('/schedule');
+            data = await res.json();
+        } catch (e) {
+            data = { missing: true, error: String(e) };
+        }
+
+        if (data.missing) {
+            document.getElementById('sched-missing').style.display = '';
+            document.getElementById('sched-ui').style.display = 'none';
+            document.getElementById('sched-missing-list').style.display = '';
+            return;
+        }
+
+        scheduleData = data;
+        document.getElementById('sched-missing').style.display = 'none';
+        document.getElementById('sched-ui').style.display = '';
+
+        // Phase badge
+        const badge = document.getElementById('sched-phase-badge');
+        badge.textContent = `Phase ${data.phase} · ${data.status}`;
+        badge.style.display = '';
+
+        // Build radar grid
+        buildGrid(radarObjects);
+
+        // Wire controls
+        document.getElementById('sched-slider').addEventListener('input', e => {
+            stopPlayback();
+            applyHour(parseInt(e.target.value, 10));
+        });
+
+        document.getElementById('sched-play').addEventListener('click', () => {
+            if (isPlaying) { stopPlayback(); } else { startPlayback(); }
+        });
+
+        document.getElementById('sched-prev').addEventListener('click', () => {
+            stopPlayback();
+            applyHour((currentHour - 1 + 24) % 24);
+        });
+
+        document.getElementById('sched-next').addEventListener('click', () => {
+            stopPlayback();
+            applyHour((currentHour + 1) % 24);
+        });
+
+        document.getElementById('sched-speed').addEventListener('change', () => {
+            if (isPlaying) { stopPlayback(); startPlayback(); }
+        });
+
+        // Apply hour 0 on load
+        applyHour(0);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  BOOTSTRAP
+    // ══════════════════════════════════════════════════════════
+
+    (async function init() {
+        try {
+            await Promise.all([loadBorder(), loadRadars()]);
+            // Schedule loads after radars so radarObjects is populated
+            await loadSchedule();
+        } catch (err) {
+            console.error('Failed to load data:', err);
+            document.querySelector('.loading-text').textContent = 'Error loading data — check console';
+            return;
+        }
+        document.getElementById('loading-overlay').classList.add('hidden');
+    })();
+
+    </script>
+</body>
+</html>
