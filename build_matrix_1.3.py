@@ -76,7 +76,7 @@ Input:   punjab_border.geojson
 Output:  c_matrix.json    (N_radars x K_boundary_points binary matrix)
          radar_meta.json  (pass-through re-export of the loaded radar list,
                             same schema as radar_meta_optimized.json — kept
-                            under this filename so scheduler_1_2 (1).py and
+                             under this filename so scheduler.py and
                             generate_czml.py need no changes)
 
 Cross-file invariant introduced by consuming external placement (see also
@@ -149,10 +149,49 @@ INTERVAL_M  = 250     # metres between consecutive boundary points
 H_TARGET = 0.0
 
 # ── Earth curvature ──────────────────────────────────────────
+#
+# Physical constants for terrain LOS Earth-curvature correction.
+#
+# EARTH_RADIUS_M (R_E)
+#   The geometric mean radius of the Earth, ~6,371 km.  This is the
+#   physical radius of the sphere that best approximates the real geoid.
+#   It is NOT what we use directly in LOS calculations because the
+#   atmosphere bends radio rays downward, which effectively lets them
+#   "see over" terrain slightly further than pure geometry would allow.
+#
+# REFRACTION_FACTOR (K_REFRACTION)
+#   The atmospheric refraction factor k.  Under standard tropospheric
+#   conditions (temperature/pressure/humidity lapse rates per ITU-R P.834),
+#   radio rays travel in arcs as if the Earth were flat but had a radius
+#   of k × R_E.  The conventional value k = 4/3 (≈ 1.333) is the
+#   standard engineering approximation for temperate climates; k = 1.0
+#   means no atmospheric bending (geometric optics only); k > 1 means
+#   rays bend toward Earth (increased effective horizon range).
+#
+# EFFECTIVE_EARTH_RADIUS (R_EFF)
+#   R_EFF = K_REFRACTION × R_E  — the "effective Earth radius" used in
+#   h_bulge() to compute the terrain-curvature correction applied to
+#   every LOS ray sample.  Change ONLY this derived constant affects the
+#   LOS geometry; it is intentionally kept as an explicit product so the
+#   physical (R_E) and atmospheric (K_REFRACTION) contributions remain
+#   separately identifiable.
+#
+# To change the model:
+#   - Different atmospheric condition: adjust K_REFRACTION only.
+#   - Different planet / ellipsoid: adjust R_E only.
+#   - Default (k=4/3, R_E=6371 km) reproduces standard radio-horizon
+#     practice and matches optimize_placement.py's identical block.
+#
 ENABLE_EARTH_CURVATURE = True
-R_E   = 6_371_000.0          # mean Earth radius, m
-K_REFRACTION = 4.0 / 3.0     # standard radio refraction factor
-R_EFF = K_REFRACTION * R_E   # ≈ 8,494,667 m
+EARTH_RADIUS_M  = 6_371_000.0   # geometric mean Earth radius [m]
+REFRACTION_FACTOR = 4.0 / 3.0   # standard tropospheric refraction factor k
+# Effective Earth radius used in all LOS bulge calculations:
+#   R_EFF = k × R_E ≈ 8,494,667 m
+# Increasing k makes the horizon farther (more coverage per LOS ray);
+# setting k=1.0 reverts to pure geometric line-of-sight.
+R_E   = EARTH_RADIUS_M          # backward-compat alias (used nowhere else internally)
+K_REFRACTION = REFRACTION_FACTOR # backward-compat alias
+R_EFF = REFRACTION_FACTOR * EARTH_RADIUS_M  # ← used by h_bulge()
 
 # ── LOS ray march ────────────────────────────────────────────
 DEM_PIXEL_M = 30.0            # GLO-30 resolution -> one check per pixel

@@ -17,7 +17,7 @@ What this script does:
      exist and, per type: name, exact count to place, max range, antenna
      height, elevation FOV window, azimuth half-width, plus Energy/Cooling
      (L, C) values that this script does NOT use itself but saves for a
-     future updated scheduler_1_2.py.
+     future updated scheduler.py.
   2. Loads the border geojson + DEM (same auto-UTM-detection /
      bilinear-elevation machinery as build_matrix_1.3.py), and builds a
      candidate lattice of (x, y, boresight_deg) sites by calling
@@ -34,7 +34,7 @@ What this script does:
      for later scheduler use).
 
 What this script deliberately does NOT do (out of scope for this task):
-  - It does NOT modify build_matrix_1.3.py, scheduler_1_2.py, or
+  - It does NOT modify build_matrix_1.3.py, scheduler.py, or
     generate_czml.py.
   - It does NOT produce c_matrix.json — that stays build_matrix_1.3.py's
     job. Wiring build_matrix_1.3.py to consume radar_meta_optimized.json as
@@ -89,7 +89,7 @@ from scipy.spatial import cKDTree
 from ortools.sat.python import cp_model
 
 # Console output below uses box-drawing/checkmark characters (matching
-# build_matrix_1.3.py's and scheduler_1_2.py's existing print style) --
+# build_matrix_1.3.py's and scheduler.py's existing print style) --
 # force UTF-8 on stdout so this doesn't crash under a plain Windows
 # console (cp1252), which can't encode them.
 if hasattr(sys.stdout, "reconfigure"):
@@ -142,14 +142,31 @@ TERRITORY_MARGIN_M = max(CANDIDATE_DEPTH_RINGS_M) + 5_000
 DEDUPE_CANDIDATES = True
 
 # CP-SAT wall-clock budget for the placement solve, same role/units as
-# scheduler_1_2 (1).py's TIME_LIMIT.
+# scheduler.py's TIME_LIMIT.
 TIME_LIMIT = 300.0
 
-# ── Earth curvature (copied from build_matrix_1.3.py) ───────────
+# ── Earth curvature (mirrored from build_matrix_1.3.py) ────────────────────
+#
+# These constants MUST remain consistent with build_matrix_1.3.py's
+# EARTH_RADIUS_M / REFRACTION_FACTOR / R_EFF block.  optimize_placement.py
+# is intentionally self-contained (importing build_matrix_1.3.py would
+# execute its Steps 1-6 at import time), so these are duplicated rather
+# than imported — but they represent the SAME physical model.
+#
+# EARTH_RADIUS_M  — geometric mean Earth radius, ~6,371 km.
+# REFRACTION_FACTOR (k=4/3) — standard tropospheric refraction factor:
+#   radio rays bend toward Earth, giving an effective horizon range
+#   equivalent to a flat Earth with radius k × R_E.  k=1.0 → no bending.
+# R_EFF = k × R_E — the effective Earth radius used in h_bulge().
+#   Separate from EARTH_RADIUS_M so the physical radius and atmospheric
+#   correction are independently adjustable.
 ENABLE_EARTH_CURVATURE = True
-R_E   = 6_371_000.0          # mean Earth radius, m
-K_REFRACTION = 4.0 / 3.0     # standard radio refraction factor
-R_EFF = K_REFRACTION * R_E   # ~ 8,494,667 m
+EARTH_RADIUS_M    = 6_371_000.0   # geometric mean Earth radius [m]
+REFRACTION_FACTOR = 4.0 / 3.0     # standard tropospheric refraction factor k
+# Effective Earth radius (used in h_bulge): R_EFF = k × R_E ≈ 8,494,667 m
+R_E          = EARTH_RADIUS_M      # backward-compat alias
+K_REFRACTION = REFRACTION_FACTOR   # backward-compat alias
+R_EFF        = REFRACTION_FACTOR * EARTH_RADIUS_M  # ← used by h_bulge()
 
 # ── LOS ray march (copied from build_matrix_1.3.py) ─────────────
 DEM_PIXEL_M = 30.0
@@ -167,7 +184,7 @@ H_TARGET = 0.0
 
 
 # ══════════════════════════════════════════════════════════════
-#  HELPERS copied verbatim from scheduler_1_2 (1).py for a consistent
+#  HELPERS copied verbatim from scheduler.py for a consistent
 #  look/feel on the solve portion of this script's output.
 # ══════════════════════════════════════════════════════════════
 
@@ -845,7 +862,7 @@ def prompt_radar_types():
     fields. Energy/cooling_L/cooling_C are NOT used anywhere in this
     script's own optimization -- they're captured here and passed straight
     through to write_type_config_json() for a future updated
-    scheduler_1_2.py to consume instead of its current hardcoded
+    scheduler.py to consume instead of its current hardcoded
     BUDGET_BY_TYPE / global L,C.
     """
     print("\n=== optimize_placement.py — Radar Type Configuration ===")
@@ -863,7 +880,7 @@ def prompt_radar_types():
         az_halfwidth = _prompt_float("  Azimuth beam half-width (deg, e.g. 60.0): > ")
         energy_budget = _prompt_float(
             "  Energy/budget value (max ON-slots per schedule window -- "
-            "currently 24 in scheduler_1_2.py, but you may change that "
+            "currently 24 in scheduler.py, but you may change that "
             "later; for scheduler config only, unused here): > "
         )
         cooling_L = _prompt_int("  Cooling L (max ON-slots per rolling window): > ")
@@ -974,7 +991,7 @@ def validate_type_config(types):
         if t["cooling_L"] > 24:
             print(
                 f"    WARNING: type '{name}' cooling_L={t['cooling_L']} exceeds "
-                "scheduler_1_2.py's current NUM_TIME_SLOTS=24 default -- fine if "
+                "scheduler.py's current NUM_TIME_SLOTS=24 default -- fine if "
                 "you've already changed that constant, otherwise this won't make "
                 "sense to the scheduler yet."
             )
@@ -992,7 +1009,7 @@ def write_placement_json(radars, path):
 
 def write_type_config_json(types, path):
     """
-    Keyed by type name, for a FUTURE updated scheduler_1_2.py to read
+    Keyed by type name, for scheduler.py to read
     instead of its current hardcoded BUDGET_BY_TYPE / global L,C. Storing
     cooling_L/cooling_C PER TYPE here is forward-looking -- today's
     scheduler applies cooling globally to every radar regardless of type;

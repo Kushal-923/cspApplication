@@ -1,2 +1,4 @@
 punjab_dem.tif
 cache/
+__pycache__/
+*.py[cod]

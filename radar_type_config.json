@@ -1,0 +1,26 @@
+{
+  "small": {
+    "count": 5,
+    "range_m": 20000.0,
+    "h_ant": 5.0,
+    "theta_min": -5.0,
+    "theta_max": 20.0,
+    "az_halfwidth": 60.0,
+    "energy_budget": 24.0,
+    "cooling_L": 5,
+    "cooling_C": 2,
+    "frequency_bands": ["VHF", "UHF"]
+  },
+  "med": {
+    "count": 5,
+    "range_m": 1000000.0,
+    "h_ant": 5.0,
+    "theta_min": -5.0,
+    "theta_max": 20.0,
+    "az_halfwidth": 60.0,
+    "energy_budget": 24.0,
+    "cooling_L": 5,
+    "cooling_C": 2,
+    "frequency_bands": ["UHF", "L_BAND", "S_BAND"]
+  }
+}

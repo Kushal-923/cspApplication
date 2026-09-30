@@ -2,7 +2,7 @@
 generate_czml.py
 =================
 Converts radar_meta.json (UTM/projected X,Y) + c_matrix.json (static LOS/FOV
-coverage) + schedule_output.json (24-hour ON/OFF matrix from scheduler_1.2.py)
+coverage) + schedule_output.json (24-hour ON/OFF matrix from scheduler.py)
 into a single CZML file that CesiumJS can play back on its timeline.
 
 For every radar it now creates THREE kinds of CZML entities:
