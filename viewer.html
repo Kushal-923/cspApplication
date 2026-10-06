@@ -1,0 +1,837 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Border Radar Coverage — 3D Simulation</title>
+
+  <!-- CesiumJS core CSS/JS. Bump the version pin here if you need a newer build. -->
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.141/Build/Cesium/Cesium.js"></script>
+  <link href="https://cesium.com/downloads/cesiumjs/releases/1.141/Build/Cesium/Widgets/widgets.css" rel="stylesheet" />
+
+  <style>
+    html, body, #cesiumContainer {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: sans-serif;
+    }
+
+    /* Small status/legend box, purely cosmetic — remove or restyle freely.
+       Left offset shifted to clear the new hamburger button in the same corner. */
+    #infoBox {
+      position: absolute;
+      top: 10px;
+      left: 60px;
+      z-index: 10;
+      background: rgba(30, 30, 30, 0.75);
+      color: #fff;
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      line-height: 1.5;
+      max-width: 280px;
+      pointer-events: none;
+    }
+    #infoBox b { color: #7fd1ff; }
+
+    /* ── Hamburger button ─────────────────────────────────────── */
+    #panelToggleBtn {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 20;
+      width: 40px;
+      height: 40px;
+      border-radius: 8px;
+      border: none;
+      background: rgba(30, 30, 30, 0.8);
+      color: #fff;
+      font-size: 18px;
+      line-height: 1;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+    }
+    #panelToggleBtn:hover { background: rgba(50, 50, 50, 0.9); }
+
+    /* ── Collapsible side panel ───────────────────────────────── */
+    #sidePanel {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      width: 260px;
+      max-width: 80vw;
+      box-sizing: border-box;
+      background: rgba(20, 20, 20, 0.93);
+      color: #fff;
+      z-index: 15;
+      padding: 64px 18px 18px;
+      transform: translateX(-100%);
+      transition: transform 0.28s ease;
+      box-shadow: 2px 0 18px rgba(0, 0, 0, 0.4);
+    }
+    #sidePanel.open { transform: translateX(0); }
+    #sidePanel h3 {
+      margin: 0 0 14px;
+      font-size: 13px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #7fd1ff;
+    }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 11px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      font-size: 13px;
+    }
+
+    /* CSS-only toggle switch */
+    .switch { position: relative; display: inline-block; width: 38px; height: 22px; flex: 0 0 auto; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch .slider {
+      position: absolute; inset: 0; cursor: pointer;
+      background: rgba(255, 255, 255, 0.22);
+      border-radius: 22px;
+      transition: background 0.2s ease;
+    }
+    .switch .slider::before {
+      content: "";
+      position: absolute;
+      height: 16px; width: 16px;
+      left: 3px; top: 3px;
+      background: #fff;
+      border-radius: 50%;
+      transition: transform 0.2s ease;
+    }
+    .switch input:checked + .slider { background: #2f8fef; }
+    .switch input:checked + .slider::before { transform: translateX(16px); }
+
+    /* ── Playback card (replaces Cesium's default Animation/Timeline widgets) ── */
+    #playbackCard {
+      position: absolute;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      width: min(520px, 90vw);
+      box-sizing: border-box;
+      background: rgba(20, 20, 20, 0.85);
+      color: #fff;
+      border-radius: 10px;
+      padding: 10px 16px 12px;
+      box-shadow: 0 4px 18px rgba(0, 0, 0, 0.4);
+      font-size: 13px;
+    }
+    .playback-row { display: flex; align-items: center; gap: 10px; }
+    #playbackPlayBtn {
+      width: 34px; height: 34px;
+      border-radius: 50%;
+      border: none;
+      background: #2f8fef;
+      color: #fff;
+      font-size: 14px;
+      cursor: pointer;
+      flex: 0 0 auto;
+    }
+    #playbackPlayBtn:hover { background: #4aa0ff; }
+    #playbackClockReadout {
+      font-variant-numeric: tabular-nums;
+      font-size: 13px;
+      min-width: 150px;
+    }
+    #playbackSpeedSelect {
+      margin-left: auto;
+      background: rgba(255, 255, 255, 0.08);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      border-radius: 6px;
+      padding: 4px 6px;
+      font-size: 12px;
+    }
+    #playbackSlider { width: 100%; margin-top: 10px; accent-color: #2f8fef; }
+
+    /* ── Radar info card ───────────────────────────────────────── */
+    #radarInfoCard {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 15;
+      width: 260px;
+      max-width: 80vw;
+      box-sizing: border-box;
+      background: rgba(20, 20, 20, 0.93);
+      color: #fff;
+      border-radius: 10px;
+      padding: 14px 16px;
+      font-size: 13px;
+      box-shadow: 0 4px 18px rgba(0, 0, 0, 0.4);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(-8px);
+      transition: opacity 0.2s ease, transform 0.2s ease;
+    }
+    #radarInfoCard.visible { opacity: 1; pointer-events: auto; transform: translateY(0); }
+    .ri-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .ri-name { font-weight: 600; font-size: 15px; margin-top: 4px; }
+    .ri-close {
+      background: none;
+      border: none;
+      color: #aaa;
+      font-size: 16px;
+      cursor: pointer;
+      line-height: 1;
+      padding: 2px;
+    }
+    .ri-close:hover { color: #fff; }
+    .ri-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 0;
+      color: #eee;
+    }
+    .ri-label {
+      color: #8fd3ff;
+      opacity: 0.8;
+      letter-spacing: 0.03em;
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+    .ri-row.placeholder .ri-value { font-style: italic; color: #777; }
+    .ri-hour-label { margin-top: 10px; }
+
+    .type-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      background: rgba(200, 200, 200, 0.3);
+      color: #fff;
+    }
+    .type-badge.Small  { background: rgba(66, 245, 194, 0.85); color: #033126; }
+    .type-badge.Medium { background: rgba(66, 165, 245, 0.85); color: #02203c; }
+    .type-badge.Large  { background: rgba(245, 110, 66, 0.85); color: #391403; }
+
+    .status-pill {
+      display: inline-block;
+      padding: 2px 9px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+    }
+    .status-pill.on  { background: rgba(76, 217, 100, 0.85); color: #06280d; }
+    .status-pill.off { background: rgba(150, 150, 150, 0.45); color: #eee; }
+
+    .hour-strip {
+      display: grid;
+      grid-template-columns: repeat(24, 1fr);
+      gap: 2px;
+      margin-top: 4px;
+    }
+    .hour-strip .cell {
+      height: 14px;
+      border-radius: 2px;
+      background: rgba(120, 120, 120, 0.35);
+    }
+    .hour-strip .cell.on { background: #4cd964; }
+    .hour-strip .cell.current { outline: 1px solid #fff; outline-offset: -1px; }
+
+    @media (max-width: 640px) {
+      #sidePanel { width: 85vw; padding-top: 58px; }
+      #radarInfoCard { width: 85vw; right: 8px; top: 58px; }
+      #playbackCard { width: 94vw; padding: 8px 10px 10px; }
+      #playbackClockReadout { min-width: 0; font-size: 12px; }
+      #infoBox { max-width: 65vw; font-size: 12px; padding: 8px 10px; }
+    }
+  </style>
+</head>
+<body>
+
+  <div id="cesiumContainer"></div>
+
+  <button id="panelToggleBtn" title="Toggle layers panel">☰</button>
+
+  <div id="infoBox">
+    <b>Radar Coverage Sim</b><br/>
+    Press ▶ on the playback bar below to animate the 24h schedule.<br/>
+    Wedges = FOV frustum. Thin lines = verified LOS to covered
+    boundary points. Both appear only while their radar is ON.
+  </div>
+
+  <div id="sidePanel">
+    <h3>Layers</h3>
+    <div class="toggle-row">
+      <span>LOS rays</span>
+      <label class="switch">
+        <input type="checkbox" id="toggleRays" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="toggle-row">
+      <span>Coverage volumes</span>
+      <label class="switch">
+        <input type="checkbox" id="toggleVolumes" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="toggle-row">
+      <span>Border coverage points</span>
+      <label class="switch">
+        <input type="checkbox" id="toggleBoundary" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <div id="playbackCard">
+    <div class="playback-row">
+      <button id="playbackPlayBtn" title="Play/Pause">▶</button>
+      <span id="playbackClockReadout">—</span>
+      <select id="playbackSpeedSelect" title="Playback speed">
+        <option value="30">30x</option>
+        <option value="60">60x</option>
+        <option value="120" selected>120x</option>
+        <option value="360">360x</option>
+        <option value="1200">1200x</option>
+      </select>
+    </div>
+    <input id="playbackSlider" type="range" min="0" max="100" step="60" value="0" />
+  </div>
+
+  <div id="radarInfoCard">
+    <div class="ri-header">
+      <div>
+        <span id="riTypeBadge" class="type-badge">—</span>
+        <div id="riName" class="ri-name">—</div>
+      </div>
+      <button id="riCloseBtn" class="ri-close" title="Close">✕</button>
+    </div>
+    <div class="ri-row"><span class="ri-label">Status</span><span id="riStatus" class="status-pill off">OFF</span></div>
+    <div class="ri-row"><span class="ri-label">Latitude</span><span id="riLat">—</span></div>
+    <div class="ri-row"><span class="ri-label">Longitude</span><span id="riLon">—</span></div>
+    <div class="ri-row"><span class="ri-label">Range</span><span id="riRange">—</span></div>
+    <div class="ri-row"><span class="ri-label">Boresight</span><span id="riBoresight">—</span></div>
+    <div class="ri-row"><span class="ri-label">Antenna height</span><span id="riAntennaHeight">—</span></div>
+    <div class="ri-row placeholder"><span class="ri-label">Frequency</span><span class="ri-value">not yet available</span></div>
+    <div class="ri-row placeholder"><span class="ri-label">Physical cond.</span><span class="ri-value">not yet available</span></div>
+    <div class="ri-label ri-hour-label">24h schedule</div>
+    <div id="riHourStrip" class="hour-strip"></div>
+  </div>
+
+  <script>
+  // ══════════════════════════════════════════════════════════════
+  //  CONFIG — fill these in before running
+  // ══════════════════════════════════════════════════════════════
+
+  const ION_ACCESS_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJhNTg5OGFhOS0wYjY0LTRlZmYtOWNjYy0xNDgwZDVjMDU3YjciLCJpZCI6NDUxNjY4LCJpc3MiOiJodHRwczovL2FwaS5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3ODI5OTU1ODd9.5Qfd3zRa_qOO7oSlzY1DjnSxnAk-w6w-Wumawa-HoQ8";
+  const TERRAIN_ASSET_ID = 5013365; // <-- replace with your uploaded punjab_dem.tif ion Asset ID
+
+  const GEOJSON_URL = "punjab_border.geojson";
+  const CZML_URL    = "radar_coverage.czml";
+
+  // Populated once the CZML data source finishes loading; the visibility
+  // toggles and the radar info panel both read from this.
+  let loadedCzmlDataSource = null;
+  // Name (without "_site"/"_range"/"_ray_..." suffix) of the radar currently
+  // shown in the info card, or null when the card is closed.
+  let activeRadarName = null;
+  // Cell elements of the currently-open info card's 24h hour strip, kept
+  // around so per-tick refreshes only need to move the "current" highlight
+  // instead of rebuilding the whole strip every frame.
+  let hourStripCells = [];
+
+  // ══════════════════════════════════════════════════════════════
+  //  VIEWER INITIALIZATION
+  // ══════════════════════════════════════════════════════════════
+
+  Cesium.Ion.defaultAccessToken = ION_ACCESS_TOKEN;
+
+  const viewer = new Cesium.Viewer("cesiumContainer", {
+    // Custom Cesium ion terrain built from your uploaded punjab_dem.tif.
+    // requestVertexNormals gives correct terrain lighting for line-of-sight
+    // context; drop it if you don't need shading.
+    terrainProvider: undefined, // set async below, Cesium requires the promise form
+    // Cesium's default circular Animation widget + Timeline bar and the
+    // built-in click infoBox are replaced by the custom playback card and
+    // radar info card built below.
+    timeline: false,
+    animation: false,
+    shouldAnimate: false,       // start paused; user presses Play
+    baseLayerPicker: true,
+    geocoder: false,
+    sceneModePicker: true,
+    infoBox: false,
+  });
+
+  viewer.scene.globe.terrainExaggeration = 15.0;
+  viewer.scene.verticalExaggerationRelativeHeight = 161.0;
+  // Cesium.Terrain.fromWorldTerrain() / CesiumTerrainProvider.fromIonAssetId()
+  // return promises in modern CesiumJS — wire this up before anything else.
+  // Resolves once terrain is ready, so the CZML/terrain-correction step
+  // below can await it instead of racing it.
+  let terrainReady;
+  const terrainReadyPromise = new Promise((res) => { terrainReady = res; });
+
+  (async function initTerrain() {
+    try {
+      viewer.terrainProvider = await Cesium.CesiumTerrainProvider.fromIonAssetId(
+        TERRAIN_ASSET_ID,
+        { requestVertexNormals: true }
+      );
+      console.log("Custom DEM terrain loaded (asset " + TERRAIN_ASSET_ID + ").");
+    } catch (err) {
+      console.error("Failed to load ion terrain asset — check TERRAIN_ASSET_ID / token.", err);
+    } finally {
+      terrainReady();
+    }
+  })();
+
+  // ══════════════════════════════════════════════════════════════
+  //  LOAD BORDER — clamped to the terrain surface
+  // ══════════════════════════════════════════════════════════════
+
+  (async function loadBorder() {
+    try {
+      // Kept as a faint neutral backdrop only — coverage status is now shown
+      // by the dynamic green/red "boundary_pt_*" points loaded from the CZML
+      // below, so this line no longer carries color meaning.
+      //
+      // Cache-busting query param: Python's http.server sends no
+      // Cache-Control headers, so a browser can silently reuse a
+      // previously-cached response for this same relative URL (e.g. from
+      // an earlier session serving a different folder on the same port)
+      // instead of re-fetching the current file on a normal reload.
+      // Appending a fresh timestamp forces every page load to fetch the
+      // actual current file.
+      const borderDataSource = await Cesium.GeoJsonDataSource.load(GEOJSON_URL + "?v=" + Date.now(), {
+        // clampToGround makes the outline hug the 3D terrain instead of
+        // floating at a flat reference height.
+        clampToGround: true,
+        stroke: Cesium.Color.fromCssColorString("#cccccc").withAlpha(0.35),
+        strokeWidth: 1.5,
+        fill: Cesium.Color.WHITE.withAlpha(0.02),
+      });
+
+      await viewer.dataSources.add(borderDataSource);
+
+      // Ground-clamped polylines need PolylineGraphics-specific clamping —
+      // GeoJsonDataSource's clampToGround handles polygons/lines for us,
+      // but if your border is a LineString (not Polygon), force it here too:
+      borderDataSource.entities.values.forEach((entity) => {
+        if (entity.polyline) {
+          entity.polyline.clampToGround = true;
+          entity.polyline.width = 1.5;
+        }
+      });
+
+      console.log("Border geojson loaded and clamped to terrain.");
+    } catch (err) {
+      console.error("Failed to load border geojson:", err);
+    }
+  })();
+
+  // ══════════════════════════════════════════════════════════════
+  //  LOAD CZML — radar sites, FOV frustums, and LOS rays
+  // ══════════════════════════════════════════════════════════════
+
+  (async function loadCzml() {
+    try {
+      // Same cache-busting rationale as the border load above — always
+      // fetch the current radar_coverage.czml, never a stale cached one.
+      const czmlDataSource = await Cesium.CzmlDataSource.load(CZML_URL + "?v=" + Date.now());
+      await viewer.dataSources.add(czmlDataSource);
+      loadedCzmlDataSource = czmlDataSource;
+      await terrainReadyPromise;
+
+      // ── Fix the geoid/ellipsoid height mismatch on both the coverage
+      //    frustums AND the LOS ray endpoints ──
+      //
+      // generate_czml.py bakes each "_range" entity's height, and both
+      // endpoints of every "_ray_*" polyline, from DEM (orthometric /
+      // geoid-referenced) elevations. CZML treats an unqualified
+      // cartographicDegrees height as ELLIPSOIDAL, and neither
+      // EllipsoidGraphics nor PolylineGraphics has a heightReference to
+      // clamp with directly. Left alone, every frustum and ray would
+      // float ~50-60m off the real terrain in this region (the local
+      // EGM geoid-to-ellipsoid separation).
+      //
+      // Fix: sample the terrain height Cesium is actually rendering at
+      // every relevant lon/lat (the same surface the "_site" markers
+      // clamp to), then re-anchor:
+      //   - frustum entities at sampledTerrainHeight + antennaHeight
+      //   - ray radar-end vertices at sampledTerrainHeight + antennaHeight
+      //   - ray target-end vertices at sampledTerrainHeight + targetHeight (0)
+      // This sidesteps needing an EGM2008 geoid grid entirely — it matches
+      // whatever datum the rendered terrain tileset actually uses. All
+      // lon/lat sampling is batched into a single sampleTerrainMostDetailed
+      // call for efficiency.
+
+      const rangeEntities = czmlDataSource.entities.values.filter(
+        (e) => e.id && e.id.endsWith("_range") && e.position && e.properties
+      );
+      const rayEntities = czmlDataSource.entities.values.filter(
+        (e) => e.id && e.id.includes("_ray_") && e.polyline && e.properties
+      );
+
+      // Build one combined list of Cartographic samples, tagging where
+      // each result needs to go back to.
+      const sampleCartographics = [];
+      const sampleTags = []; // { kind: "range"|"rayStart"|"rayEnd", entityIndex }
+
+      rangeEntities.forEach((entity, i) => {
+        const cart = entity.position.getValue(viewer.clock.currentTime);
+        sampleCartographics.push(Cesium.Cartographic.fromCartesian(cart));
+        sampleTags.push({ kind: "range", index: i });
+      });
+
+      const rayPositionArrays = rayEntities.map((entity) =>
+        entity.polyline.positions.getValue(viewer.clock.currentTime)
+      );
+      rayPositionArrays.forEach((positions, i) => {
+        // positions[0] = radar end, positions[1] = boundary-point end
+        sampleCartographics.push(Cesium.Cartographic.fromCartesian(positions[0]));
+        sampleTags.push({ kind: "rayStart", index: i });
+        sampleCartographics.push(Cesium.Cartographic.fromCartesian(positions[1]));
+        sampleTags.push({ kind: "rayEnd", index: i });
+      });
+
+      try {
+        const sampled = await Cesium.sampleTerrainMostDetailed(
+          viewer.terrainProvider,
+          sampleCartographics
+        );
+
+        // Re-anchor frustums
+        rangeEntities.forEach((entity, i) => {
+          const tagIdx = sampleTags.findIndex((t) => t.kind === "range" && t.index === i);
+          const antennaHeight = entity.properties.antennaHeight
+            ? entity.properties.antennaHeight.getValue(viewer.clock.currentTime)
+            : 0;
+          const terrainHeight = sampled[tagIdx].height;
+          const lon = Cesium.Math.toDegrees(sampled[tagIdx].longitude);
+          const lat = Cesium.Math.toDegrees(sampled[tagIdx].latitude);
+          entity.position = new Cesium.ConstantPositionProperty(
+            Cesium.Cartesian3.fromDegrees(lon, lat, terrainHeight + antennaHeight)
+          );
+        });
+
+        // Re-anchor ray endpoints (both vertices per ray)
+        rayEntities.forEach((entity, i) => {
+          const startTagIdx = sampleTags.findIndex((t) => t.kind === "rayStart" && t.index === i);
+          const endTagIdx = sampleTags.findIndex((t) => t.kind === "rayEnd" && t.index === i);
+
+          const antennaHeight = entity.properties.antennaHeight
+            ? entity.properties.antennaHeight.getValue(viewer.clock.currentTime)
+            : 0;
+          const targetHeight = entity.properties.targetHeight
+            ? entity.properties.targetHeight.getValue(viewer.clock.currentTime)
+            : 0;
+
+          const startSample = sampled[startTagIdx];
+          const endSample = sampled[endTagIdx];
+
+          const newPositions = [
+            Cesium.Cartesian3.fromDegrees(
+              Cesium.Math.toDegrees(startSample.longitude),
+              Cesium.Math.toDegrees(startSample.latitude),
+              startSample.height + antennaHeight
+            ),
+            Cesium.Cartesian3.fromDegrees(
+              Cesium.Math.toDegrees(endSample.longitude),
+              Cesium.Math.toDegrees(endSample.latitude),
+              endSample.height + targetHeight
+            ),
+          ];
+          entity.polyline.positions = newPositions;
+        });
+
+        console.log(
+          `Re-anchored ${rangeEntities.length} coverage frustum(s) and ` +
+          `${rayEntities.length} LOS ray(s) to sampled terrain height ` +
+          `(corrects DEM geoid vs. ellipsoid offset).`
+        );
+      } catch (sampleErr) {
+        console.warn(
+          "Terrain sampling for height correction failed — frustums/rays will use " +
+          "the uncorrected DEM-derived heights baked into the CZML (may be offset ~50-60m).",
+          sampleErr
+        );
+      }
+
+      // ── Sync the custom playback card to the CZML document clock ──
+      // The CZML "document" packet already carries interval/currentTime/
+      // multiplier, and Cesium applies it automatically on load, but we
+      // re-assert it explicitly here so the playback card definitely
+      // reflects the full 24h window even if load order changes.
+      const clock = czmlDataSource.clock;
+      if (clock) {
+        viewer.clock.startTime = clock.startTime.clone();
+        viewer.clock.stopTime = clock.stopTime.clone();
+        viewer.clock.currentTime = clock.startTime.clone();
+        viewer.clock.multiplier = clock.multiplier;
+        viewer.clock.clockRange = Cesium.ClockRange.LOOP_STOP;
+      }
+      initPlaybackCard(viewer);
+
+      // Fly the camera to frame all loaded radar entities.
+      viewer.zoomTo(czmlDataSource);
+
+      console.log("CZML radar coverage loaded:", czmlDataSource.entities.values.length, "entities.");
+    } catch (err) {
+      console.error("Failed to load CZML:", err);
+    }
+  })();
+
+  // ══════════════════════════════════════════════════════════════
+  //  CUSTOM PLAYBACK CARD — thin UI skin over viewer.clock only.
+  //  Never touches CZML/schedule data; it only reads/writes
+  //  currentTime, multiplier and shouldAnimate.
+  // ══════════════════════════════════════════════════════════════
+
+  function initPlaybackCard(v) {
+    const clock = v.clock;
+    const playBtn = document.getElementById("playbackPlayBtn");
+    const readout = document.getElementById("playbackClockReadout");
+    const speedSelect = document.getElementById("playbackSpeedSelect");
+    const slider = document.getElementById("playbackSlider");
+
+    const totalSeconds = Cesium.JulianDate.secondsDifference(clock.stopTime, clock.startTime);
+    slider.min = 0;
+    slider.max = Math.max(1, Math.floor(totalSeconds));
+    slider.step = 60;
+    speedSelect.value = String(clock.multiplier);
+
+    let userScrubbing = false;
+
+    function formatReadout(time) {
+      const iso = Cesium.JulianDate.toDate(time).toISOString(); // e.g. "2026-01-01T03:00:00.000Z"
+      return iso.slice(0, 10) + "  " + iso.slice(11, 19) + " UTC";
+    }
+
+    function updatePlayGlyph() {
+      playBtn.textContent = clock.shouldAnimate ? "⏸" : "▶";
+    }
+
+    function refreshFromClock() {
+      if (!userScrubbing) {
+        const elapsed = Cesium.JulianDate.secondsDifference(clock.currentTime, clock.startTime);
+        slider.value = Math.min(Math.max(elapsed, 0), Number(slider.max));
+      }
+      readout.textContent = formatReadout(clock.currentTime);
+      updatePlayGlyph();
+    }
+
+    slider.addEventListener("input", () => {
+      userScrubbing = true;
+      const seconds = Number(slider.value);
+      clock.currentTime = Cesium.JulianDate.addSeconds(clock.startTime, seconds, new Cesium.JulianDate());
+      readout.textContent = formatReadout(clock.currentTime);
+      refreshRadarInfoPanel();
+    });
+    slider.addEventListener("change", () => { userScrubbing = false; });
+
+    playBtn.addEventListener("click", () => {
+      clock.shouldAnimate = !clock.shouldAnimate;
+      updatePlayGlyph();
+    });
+
+    speedSelect.addEventListener("change", () => {
+      clock.multiplier = Number(speedSelect.value);
+    });
+
+    clock.onTick.addEventListener(refreshFromClock);
+    refreshFromClock();
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  //  LAYER VISIBILITY TOGGLES — set only the top-level Entity.show
+  //  flag, which Cesium ANDs with each entity's graphics-level show
+  //  (the schedule-driven ellipsoid.show / polyline.show interval
+  //  data). This never mutates that interval data, so toggling a
+  //  layer off and back on restores exactly the pre-toggle,
+  //  schedule-driven appearance.
+  // ══════════════════════════════════════════════════════════════
+
+  function setEntityGroupVisibility(matchFn, visible) {
+    if (!loadedCzmlDataSource) return;
+    loadedCzmlDataSource.entities.values.forEach((entity) => {
+      if (entity.id && matchFn(entity.id)) {
+        entity.show = visible;
+      }
+    });
+  }
+
+  document.getElementById("toggleRays").addEventListener("change", (e) => {
+    setEntityGroupVisibility((id) => id.includes("_ray_"), e.target.checked);
+  });
+  document.getElementById("toggleVolumes").addEventListener("change", (e) => {
+    setEntityGroupVisibility((id) => id.endsWith("_range"), e.target.checked);
+  });
+  document.getElementById("toggleBoundary").addEventListener("change", (e) => {
+    setEntityGroupVisibility((id) => id.startsWith("boundary_pt_"), e.target.checked);
+  });
+
+  // ══════════════════════════════════════════════════════════════
+  //  HAMBURGER PANEL TOGGLE
+  // ══════════════════════════════════════════════════════════════
+
+  document.getElementById("panelToggleBtn").addEventListener("click", () => {
+    document.getElementById("sidePanel").classList.toggle("open");
+  });
+
+  // ══════════════════════════════════════════════════════════════
+  //  RADAR INFO PANEL
+  // ══════════════════════════════════════════════════════════════
+
+  // Any of "{name}_site" / "{name}_range" / "{name}_ray_{j}" resolve to the
+  // same radar name; anything else (e.g. "boundary_pt_*") resolves to null
+  // and is silently ignored by the click handler.
+  function resolveRadarName(id) {
+    if (!id) return null;
+    if (id.endsWith("_site")) return id.slice(0, -"_site".length);
+    if (id.endsWith("_range")) return id.slice(0, -"_range".length);
+    const rayIdx = id.indexOf("_ray_");
+    if (rayIdx !== -1) return id.slice(0, rayIdx);
+    return null;
+  }
+
+  // Builds the 24 hour-strip cells once per panel open. Coverage status per
+  // hour is sampled (at the midpoint of each hour) from the SAME
+  // ellipsoid.show TimeIntervalCollectionProperty already on the CZML
+  // "_range" entity — slots_to_intervals() in generate_czml.py merges
+  // contiguous runs, so the collection generally does not have exactly 24
+  // raw intervals, which is why this samples fixed timestamps instead of
+  // iterating the raw interval list.
+  function buildHourStrip(rangeEntity, startTime, stopTime) {
+    const container = document.getElementById("riHourStrip");
+    container.innerHTML = "";
+    hourStripCells = [];
+    if (!rangeEntity || !rangeEntity.ellipsoid || !rangeEntity.ellipsoid.show) return;
+
+    const totalSeconds = Cesium.JulianDate.secondsDifference(stopTime, startTime);
+    const hourSeconds = totalSeconds / 24;
+
+    for (let h = 0; h < 24; h++) {
+      const midSeconds = hourSeconds * (h + 0.5);
+      const sampleTime = Cesium.JulianDate.addSeconds(startTime, midSeconds, new Cesium.JulianDate());
+      const isOn = !!rangeEntity.ellipsoid.show.getValue(sampleTime);
+      const cell = document.createElement("div");
+      cell.className = "cell" + (isOn ? " on" : "");
+      cell.title = `Hour ${h}:00–${h + 1}:00 — ${isOn ? "ON" : "OFF"}`;
+      container.appendChild(cell);
+      hourStripCells.push(cell);
+    }
+  }
+
+  function updateHourStripCurrent(currentTime, startTime, stopTime) {
+    if (hourStripCells.length !== 24) return;
+    const totalSeconds = Cesium.JulianDate.secondsDifference(stopTime, startTime);
+    const hourSeconds = totalSeconds / 24;
+    const elapsed = Cesium.JulianDate.secondsDifference(currentTime, startTime);
+    const currentHourIdx = Math.min(23, Math.max(0, Math.floor(elapsed / hourSeconds)));
+    hourStripCells.forEach((cell, idx) => {
+      cell.classList.toggle("current", idx === currentHourIdx);
+    });
+  }
+
+  // Re-runs on every clock tick (see viewer.clock.onTick below) so the
+  // STATUS pill and the highlighted current-hour cell stay live during
+  // playback without needing to click the radar again. No-ops when no
+  // panel is open, and never mutates the clock, so it never interferes
+  // with timeline animation.
+  function refreshRadarInfoPanel() {
+    if (!activeRadarName || !loadedCzmlDataSource) return;
+    const rangeEntity = loadedCzmlDataSource.entities.getById(activeRadarName + "_range");
+    const currentTime = viewer.clock.currentTime;
+
+    let isOn = false;
+    if (rangeEntity && rangeEntity.ellipsoid && rangeEntity.ellipsoid.show) {
+      isOn = !!rangeEntity.ellipsoid.show.getValue(currentTime);
+    }
+    const statusEl = document.getElementById("riStatus");
+    statusEl.textContent = isOn ? "ON" : "OFF";
+    statusEl.className = "status-pill " + (isOn ? "on" : "off");
+
+    updateHourStripCurrent(currentTime, viewer.clock.startTime, viewer.clock.stopTime);
+  }
+
+  function showRadarInfoPanel(radarName) {
+    if (!loadedCzmlDataSource) return;
+    const siteEntity = loadedCzmlDataSource.entities.getById(radarName + "_site");
+    if (!siteEntity) return;
+
+    activeRadarName = radarName;
+    const currentTime = viewer.clock.currentTime;
+    const props = siteEntity.properties;
+    const type = props && props.type ? props.type.getValue(currentTime) : null;
+    const rangeM = props && props.range_m ? props.range_m.getValue(currentTime) : null;
+    const boresight = props && props.boresight_deg ? props.boresight_deg.getValue(currentTime) : null;
+    const antennaHeight = props && props.antennaHeight ? props.antennaHeight.getValue(currentTime) : null;
+
+    const cart = siteEntity.position.getValue(currentTime);
+    const carto = Cesium.Cartographic.fromCartesian(cart);
+    const lat = Cesium.Math.toDegrees(carto.latitude);
+    const lon = Cesium.Math.toDegrees(carto.longitude);
+
+    document.getElementById("riName").textContent = radarName;
+    const badge = document.getElementById("riTypeBadge");
+    badge.textContent = type || "Unknown";
+    badge.className = "type-badge" + (type ? " " + type : "");
+
+    document.getElementById("riLat").textContent = lat.toFixed(5) + "°";
+    document.getElementById("riLon").textContent = lon.toFixed(5) + "°";
+    document.getElementById("riRange").textContent = rangeM != null ? (rangeM / 1000).toFixed(1) + " km" : "—";
+    document.getElementById("riBoresight").textContent = boresight != null ? boresight.toFixed(1) + "°" : "—";
+    document.getElementById("riAntennaHeight").textContent = antennaHeight != null ? antennaHeight.toFixed(1) + " m" : "—";
+
+    const rangeEntity = loadedCzmlDataSource.entities.getById(radarName + "_range");
+    buildHourStrip(rangeEntity, viewer.clock.startTime, viewer.clock.stopTime);
+    refreshRadarInfoPanel();
+
+    document.getElementById("radarInfoCard").classList.add("visible");
+  }
+
+  function closeRadarInfoPanel() {
+    activeRadarName = null;
+    document.getElementById("radarInfoCard").classList.remove("visible");
+  }
+
+  document.getElementById("riCloseBtn").addEventListener("click", closeRadarInfoPanel);
+  viewer.clock.onTick.addEventListener(refreshRadarInfoPanel);
+
+  // ══════════════════════════════════════════════════════════════
+  //  CLICK A RADAR (site / wedge / ray) TO OPEN ITS INFO CARD
+  // ══════════════════════════════════════════════════════════════
+
+  const clickHandler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+  clickHandler.setInputAction((movement) => {
+    const picked = viewer.scene.pick(movement.position);
+    if (Cesium.defined(picked) && picked.id) {
+      console.log("Picked entity:", picked.id.id, picked.id.name);
+      const radarName = resolveRadarName(picked.id.id);
+      if (radarName) {
+        showRadarInfoPanel(radarName);
+      }
+    }
+  }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+  </script>
+</body>
+</html>
+

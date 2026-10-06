@@ -1,0 +1,7 @@
+numpy
+geopandas
+shapely
+rasterio
+scipy
+pyproj
+ortools

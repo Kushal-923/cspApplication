@@ -1,0 +1,19 @@
+{
+  "id": "punjab",
+  "name": "Punjab",
+  "description": "Punjab border region (India-Pakistan). GLO-30 DEM at 30m resolution. Border GeoJSON traces the Line of Control / international border in the Punjab sector.",
+  "geojson": "border.geojson",
+  "dem": "dem.tif",
+  "reference_point": [74.8723, 31.6340],
+  "crs_hint": "EPSG:32643",
+  "resolution_m": 30.0,
+  "bounds": {
+    "minx": 73.8,
+    "miny": 30.5,
+    "maxx": 75.5,
+    "maxy": 32.5
+  },
+  "area_km2": 50323,
+  "border_length_km": 445,
+  "thumbnail": null
+}

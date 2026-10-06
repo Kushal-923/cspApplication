@@ -2,3 +2,9 @@ punjab_dem.tif
 cache/
 __pycache__/
 *.py[cod]
+venv/
+.venv/
+node_modules/
+runs/
+.env
+.env.*
