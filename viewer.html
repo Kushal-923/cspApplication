@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -342,8 +342,9 @@
   const ION_ACCESS_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJhNTg5OGFhOS0wYjY0LTRlZmYtOWNjYy0xNDgwZDVjMDU3YjciLCJpZCI6NDUxNjY4LCJpc3MiOiJodHRwczovL2FwaS5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3ODI5OTU1ODd9.5Qfd3zRa_qOO7oSlzY1DjnSxnAk-w6w-Wumawa-HoQ8";
   const TERRAIN_ASSET_ID = 5013365; // <-- replace with your uploaded punjab_dem.tif ion Asset ID
 
-  const GEOJSON_URL = "punjab_border.geojson";
-  const CZML_URL    = "radar_coverage.czml";
+  const params = new URLSearchParams(window.location.search);
+  const GEOJSON_URL = params.get("geojson") || "punjab_border.geojson";
+  const CZML_URL    = params.get("czml") || "radar_coverage.czml";
 
   // Populated once the CZML data source finishes loading; the visibility
   // toggles and the radar info panel both read from this.
